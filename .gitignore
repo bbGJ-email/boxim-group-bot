@@ -1,0 +1,16 @@
+# 环境与凭据（绝不提交）
+bot.env
+*.env
+.env
+
+# 运行数据
+bot.log
+*.log
+punch_data.json
+violation_data.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/

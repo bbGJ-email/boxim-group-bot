@@ -1,0 +1,2 @@
+boxim-sdk>=3.2.7
+aiohttp>=3.9.0
