@@ -29,7 +29,7 @@ class BotConfig:
     mute_durations: List[int] = field(default_factory=lambda: [60, 300, 1800, 7200])  # 秒
 
     # ---- 处理 ----
-    sensitive_action: str = "warn"       # warn=仅警告 recall_warn=撤回+警告
+    sensitive_action: str = os.environ.get("SENSITIVE_ACTION", "recall_warn")   # warn=仅警告 recall_warn=撤回+警告
     trigger_char: str = "/"
     warning_message: str = "⚠️ 检测到敏感内容，请注意言行！"
     mute_notice_template: str = "🔇 {user} 因多次违规被禁言 {duration}，累计违规 {count} 次"

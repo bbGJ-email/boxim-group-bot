@@ -61,6 +61,7 @@ export AI_RECHECK_ENABLED=true                    # AI 复检开关
 export AI_API_URL=https://api.openai.com/v1/chat/completions
 export AI_API_KEY=sk-xxx
 export AI_MODEL_ID=gpt-4o-mini
+export SENSITIVE_ACTION=recall_warn               # warn=仅警告 / recall_warn=撤回+警告
 
 python3 bot.py        # 前台运行
 ./run.sh              # 后台运行
