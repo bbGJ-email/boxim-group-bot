@@ -624,9 +624,9 @@ class GroupModerationBot:
         self.bot_id = me.get("id", 0) if isinstance(me, dict) else 0
         logger.info("登录成功，机器人 ID: %s", self.bot_id)
 
-        # 制作声明：账号签名
+        # 制作声明：账号签名（配置了 BOT_ACCOUNT_SIGNATURE 才启用）
         try:
-            if (me.get("signature") or "") != ACCOUNT_SIGNATURE:
+            if ACCOUNT_SIGNATURE and (me.get("signature") or "") != ACCOUNT_SIGNATURE:
                 await self.im.aupdate_profile(signature=ACCOUNT_SIGNATURE)
                 logger.info("已更新账号签名为制作声明")
         except Exception as exc:

@@ -42,20 +42,16 @@ SYMBOL_CN = {
 }
 
 
-# ---------------- 制作声明 ----------------
-ACCOUNT_SIGNATURE = os.environ.get(
-    "BOT_ACCOUNT_SIGNATURE",
-    "",
-)
-MSG_SIGNATURE = os.environ.get(
-    "BOT_MSG_SIGNATURE",
-    "",
-)
+# ---------------- 制作声明（可选，通过环境变量注入，默认关闭） ----------------
+ACCOUNT_SIGNATURE = os.environ.get("BOT_ACCOUNT_SIGNATURE", "")
+MSG_SIGNATURE = os.environ.get("BOT_MSG_SIGNATURE", "")
 
 
 def append_signature(text: str) -> str:
-    """给消息追加制作声明（已含声明的不重复加）。"""
+    """给消息追加制作声明（未配置 BOT_MSG_SIGNATURE 时不追加，已含声明的不重复加）。"""
     if not text or not MSG_SIGNATURE:
+        return text
+    if MSG_SIGNATURE[:6] in text:    # 已含声明的不重复加
         return text
     return f"{text}\n{MSG_SIGNATURE}"
 
@@ -671,7 +667,7 @@ footer button{background:var(--acc);border:none;color:#fff;border-radius:8px;pad
 </style>
 </head>
 <body>
-<header><b>🤖 机器人控制台</b><span id="st"></span><div class="spacer"></div><span><a style="color:var(--acc)" href="https://github.com/bbGJ-email/boxim-group-bot" target="_blank">源码开源</a></span></header>
+<header><b>🤖 机器人控制台</b><span id="st"></span><div class="spacer"></div>__SIGNATURE_HTML__<span>Web 控制台</span></header>
 <main>
 <aside>
 <div class="tabs"><button class="on" data-t="group">群聊</button><button data-t="private">私聊</button></div>
@@ -758,7 +754,11 @@ class WebConsole:
 
     async def _index(self, request):
         from aiohttp import web
-        return web.Response(text=WEB_HTML, content_type="text/html")
+        sig_html = ""
+        if ACCOUNT_SIGNATURE:
+            sig_html = f"<span>{ACCOUNT_SIGNATURE}</span>"
+        return web.Response(text=WEB_HTML.replace("__SIGNATURE_HTML__", sig_html),
+                            content_type="text/html")
 
     async def _chats(self, request):
         from aiohttp import web
