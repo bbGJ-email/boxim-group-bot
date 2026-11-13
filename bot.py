@@ -29,6 +29,7 @@ from config import BotConfig
 try:
     import boxim
     from boxim import BoxIM
+    from boxim.util.core.types import MessageType
 except ImportError:
     print("缺少 boxim-sdk，请先: pip install boxim-sdk")
     raise
@@ -591,6 +592,7 @@ class GroupModerationBot:
         self._admin_cache: Dict[int, Tuple[bool, float]] = {}   # group_id -> (is_admin, ts)
         self._runtime_punch_enabled = config.punch_enabled
         self._name_cache: Dict[str, Tuple[int, str]] = {}       # 名称解析缓存 u:/g: 前缀
+        self._nick_cache: Dict[int, str] = {}                   # user_id -> 昵称
 
         # 运行统计
         self.stats = {
@@ -744,9 +746,11 @@ class GroupModerationBot:
         if words and all(set(w) == {"*"} for w in words):
             masked_words = "已被服务端打码（原词不可见）"
         else:
-            masked_words = "、".join(words) or "***"
+            # 按原规格展示掩码词，避免在群里二次传播违规内容
+            masked_words = "、".join(self.mask_word(w) for w in words) or "***"
         lines = [cfg.warning_message]
-        lines.append(f"👤 用户: <at id={sender_id}></at>")
+        nick = await self.get_nickname(sender_id, str(msg.get("sendNickName") or ""))
+        lines.append(f"👤 用户: @{nick}（ID: {sender_id}）")
         lines.append(f"🔇 敏感词: {masked_words}")
         if detection.get("hit_types"):
             lines.append(f"🏷️ 违规类型: {'、'.join(detection['hit_types'])}")
@@ -772,11 +776,15 @@ class GroupModerationBot:
                     logger.warning("撤回失败: %s", exc)
             # 禁言
             if count >= cfg.max_violations:
-                await self.mute_user(group_id, sender_id, count=count, auto=True)
+                await self.mute_user(group_id, sender_id, count=count, auto=True, user_name=nick)
         else:
             lines.append("ℹ️ 机器人非本群管理员，无法撤回或禁言")
 
-        await self.send_group(group_id, "\n".join(lines), at_users=[sender_id] if not recalled else None)
+        # 引用原敏感消息（撤回后原消息已不存在，不再引用）
+        quote_id = None if recalled else int(msg.get("id") or 0) or None
+        await self.send_group(group_id, "\n".join(lines),
+                              at_users=[sender_id] if not recalled else None,
+                              quote_message_id=quote_id)
 
         # 自动举报检查
         should, why = self.complaints.should_complaint(sender_id, group_id, count)
@@ -928,8 +936,32 @@ class GroupModerationBot:
         self._name_cache[f"g:{token.lower()}"] = (gid, disp)
         return gid, disp, ""
 
+    async def get_nickname(self, user_id: int, known: str = "") -> str:
+        """取用户昵称：已知昵称 > 缓存 > get_user > ID 兜底。"""
+        if known and known.strip():
+            self._nick_cache[user_id] = known.strip()
+            return known.strip()
+        if user_id in self._nick_cache:
+            return self._nick_cache[user_id]
+        try:
+            user = await self.im.aget_user(user_id)
+            if isinstance(user, dict):
+                name = user.get("nickName") or user.get("showNickName") or user.get("userName")
+                if name:
+                    self._nick_cache[user_id] = str(name)
+                    return str(name)
+            elif user is not None:
+                name = getattr(user, "nick_name", None) or getattr(user, "user_name", None)
+                if name:
+                    self._nick_cache[user_id] = str(name)
+                    return str(name)
+        except Exception:
+            pass
+        return str(user_id)
+
     async def mute_user(self, group_id: int, user_id: int, duration: Optional[int] = None,
-                        count: int = 0, auto: bool = False, reason: str = "") -> bool:
+                        count: int = 0, auto: bool = False, reason: str = "",
+                        user_name: str = "") -> bool:
         """duration=None 表示自动禁言按梯度；duration<=0 或 None+永久标记为永久。"""
         cfg = self.config
         try:
@@ -962,8 +994,9 @@ class GroupModerationBot:
             )
 
         duration_text = "永久" if permanent else self._fmt_duration(duration)
+        nick = await self.get_nickname(user_id, user_name)
         notice = cfg.mute_notice_template.format(
-            user=f"<at id={user_id}></at>", duration=duration_text, count=count or "-"
+            user=nick, duration=duration_text, count=count or "-"
         )
         if reason:
             notice += f"\n📌 原因: {reason}"
@@ -983,9 +1016,10 @@ class GroupModerationBot:
         ok = await self.unmute_user(group_id, user_id, auto=True)
         if ok:
             try:
+                nick = await self.get_nickname(user_id)
                 await self.im.asend_group_text(
                     group_id,
-                    f"✅ <at id={user_id}></at> 禁言时间已到，已自动解禁",
+                    f"✅ @{nick} 禁言时间已到，已自动解禁",
                     at_users=[user_id],
                 )
             except Exception:
@@ -1004,6 +1038,17 @@ class GroupModerationBot:
             self.stats["unmute_commands"] += 1
         self.stats["unmuted_users"] += 1
         return True
+
+    @staticmethod
+    def mask_word(word: str) -> str:
+        """敏感词展示掩码：保留首字，其余打码。"""
+        if not word:
+            return "*"
+        if set(word) == {"*"}:
+            return word
+        if len(word) <= 1:
+            return "*"
+        return word[0] + "*" * (len(word) - 1)
 
     @staticmethod
     def _fmt_duration(seconds: int) -> str:
@@ -1048,14 +1093,14 @@ class GroupModerationBot:
             logger.warning("举报失败: %s", exc)
             ok = False
             if not auto:
-                await self.send_group(group_id, f"❌ 举报用户 <at id={user_id}></at> 失败: {exc}")
+                await self.send_group(group_id, f"❌ 举报用户 @{user_name} 失败: {exc}")
         self.complaints.record_event(user_id, group_id, ok, content)
         if not ok:
             return False
 
         await self.send_group(
             group_id,
-            f"📨 已{'自动' if auto else ''}举报用户 <at id={user_id}></at>（违规 {violation_count} 次）\n"
+            f"📨 已{'自动' if auto else ''}举报用户 @{user_name}（违规 {violation_count} 次）\n"
             f"类型: {self.config.complaint_reason}",
             at_users=[user_id],
         )
@@ -1139,7 +1184,7 @@ class GroupModerationBot:
             reason = " ".join(rest[1:])
         else:
             reason = " ".join(rest)
-        ok = await self.mute_user(group_id, target, duration=duration, reason=reason)
+        ok = await self.mute_user(group_id, target, duration=duration, reason=reason, user_name=disp)
         if ok:
             self.stats["mute_commands"] += 1
             await self.reply(msg, is_group,
@@ -1204,7 +1249,7 @@ class GroupModerationBot:
         ok = await self.unmute_user(group_id, target)
         if ok:
             await self.reply(msg, is_group, f"✅ 已解禁 {disp}", group_id)
-            await self.send_group(group_id, f"🎉 用户 <at id={target}></at> 已被管理员解禁", at_users=[target])
+            await self.send_group(group_id, f"🎉 用户 @{disp} 已被管理员解禁", at_users=[target])
 
     async def cmd_unmute_all(self, msg, is_group, group_id, sender_id, args):
         """群聊可省略群名，私聊必须给群名。"""
@@ -1593,11 +1638,16 @@ class GroupModerationBot:
             chunks.append(current)
         return chunks
 
-    async def send_group(self, group_id: int, text: str, at_users: Optional[List[int]] = None):
-        for part in self.split_reply(text, self.config.reply_max_length):
+    async def send_group(self, group_id: int, text: str, at_users: Optional[List[int]] = None,
+                         quote_message_id: Optional[int] = None):
+        for i, part in enumerate(self.split_reply(text, self.config.reply_max_length)):
             try:
-                await self.im.asend_group_text(group_id, part, at_users=at_users)
-                at_users = None    # 只在第一段 @
+                await self.im.asend_group_raw(
+                    group_id, part, MessageType.TEXT,
+                    at_users=at_users,
+                    quote_message_id=quote_message_id if i == 0 else None,
+                )
+                at_users = None    # 只在第一段 @，引用也只挂第一段
             except Exception as exc:
                 logger.warning("群消息发送失败: %s", exc)
                 await asyncio.sleep(1)
