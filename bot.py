@@ -25,6 +25,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import aiohttp
 
 from config import BotConfig
+from features import (GroupMemory, HumanAI, WebConsole, append_signature,
+                      ACCOUNT_SIGNATURE)
 
 try:
     import boxim
@@ -595,6 +597,8 @@ class GroupModerationBot:
         self._nick_cache: Dict[int, str] = {}                   # user_id -> 昵称
         self._flood: Dict[Tuple[int, int], deque] = defaultdict(deque)          # (group, user) -> [(ts, content)]
         self._flood_warn_ts: Dict[Tuple[int, int], float] = {}  # 上次刷屏警告时间
+        self._last_group_seq: Dict[int, int] = {}               # 各群最新 seqNo（控制台翻页用）
+        self._last_private_seq: Dict[int, int] = {}             # 各私聊最新 seqNo
 
         # 运行统计
         self.stats = {
@@ -620,6 +624,23 @@ class GroupModerationBot:
         self.bot_id = me.get("id", 0) if isinstance(me, dict) else 0
         logger.info("登录成功，机器人 ID: %s", self.bot_id)
 
+        # 制作声明：账号签名
+        try:
+            if (me.get("signature") or "") != ACCOUNT_SIGNATURE:
+                await self.im.aupdate_profile(signature=ACCOUNT_SIGNATURE)
+                logger.info("已更新账号签名为制作声明")
+        except Exception as exc:
+            logger.warning("设置账号签名失败: %s", exc)
+
+        # 扩展功能：记忆池 / 拟人 AI / Web 控制台
+        self.memory = GroupMemory(self.config.memory_data_file,
+                                  self.config.memory_summarize_threshold)
+        self.human_ai = HumanAI(self.config, self.im, self.memory)
+        self.web = None
+        if self.config.web_enabled:
+            self.web = WebConsole(self.config, self)
+            asyncio.create_task(self.web.start())
+
         # 消息中间件：统计群消息
         def stats_middleware(msg: dict, is_group: bool):
             if is_group and self.config.stats_group_messages:
@@ -631,6 +652,7 @@ class GroupModerationBot:
         await self.im.start_listening()
         self._cleanup_task = asyncio.create_task(self._cleanup_loop())
         asyncio.create_task(self._token_refresh_loop())
+        asyncio.create_task(self._memory_loop())
 
         await self._shutdown.wait()
         await self.shutdown()
@@ -657,6 +679,10 @@ class GroupModerationBot:
     async def handle_message(self, msg: dict, is_group: bool):
         try:
             if not is_group:
+                seq_p = int(msg.get("seqNo") or 0)
+                peer = int(msg.get("sendId") or 0)
+                if seq_p and peer:
+                    self._last_private_seq[peer] = seq_p
                 await self.handle_command(msg, is_group)
                 return
 
@@ -664,6 +690,29 @@ class GroupModerationBot:
             sender_id = int(msg.get("sendId") or 0)
             group_id = int(msg.get("groupId") or 0)
             content = msg.get("content", "") or ""
+
+            # 消息序号与记忆池（供控制台翻页 / AI 记忆）
+            seq = int(msg.get("seqNo") or 0)
+            if seq:
+                self._last_group_seq[group_id] = seq
+            if msg_type == 0 and content.strip() and sender_id != self.bot_id \
+                    and not content.startswith(self.config.trigger_char):
+                nick = str(msg.get("sendNickName") or sender_id)
+                self.memory.add_message(group_id, nick, content)
+                self.human_ai.remember(group_id, nick, content)
+
+            # AI 拟人对话：@机器人 或 回复机器人（群内）
+            if msg_type == 0 and content.strip() and sender_id != self.bot_id \
+                    and self.config.ai_chat_enabled and group_id not in self.config.whitelist_groups \
+                    and sender_id not in self.config.whitelist_users:
+                quote = msg.get("quoteMessage") or {}
+                at_me = isinstance(msg.get("atUserIds"), list) and self.bot_id in msg["atUserIds"]
+                reply_me = isinstance(quote, dict) and quote.get("sendId") == self.bot_id
+                lower = content.lower()
+                name_hit = any(n and n.lower() in lower for n in self.config.ai_chat_names)
+                if (at_me or reply_me or name_hit) and not re.search(r"\*{3,}", content):
+                    await self._handle_ai_chat(msg, sender_id, group_id, content)
+                    return
 
             # 命令优先（文本消息才解析）
             if msg_type == 0 and content.startswith(self.config.trigger_char):
@@ -673,6 +722,41 @@ class GroupModerationBot:
             await self.moderate_group_message(msg, msg_type, sender_id, group_id, content)
         except Exception:
             logger.exception("处理消息出错")
+
+    async def _handle_ai_chat(self, msg: dict, sender_id: int, group_id: int, content: str):
+        """@机器人 / 回复机器人 → 拟人化 AI 对话。"""
+        try:
+            question = re.sub(r"^@\S+\s*", "", content, count=1).strip() or content
+            nick = str(msg.get("sendNickName") or sender_id)
+            reply = await self.human_ai.chat(group_id, nick, question)
+            logger.info("AI 对话触发: 群=%s 问=%r → %r", group_id, question[:30], (reply or "")[:50])
+            if not reply:
+                return
+            # 拟人打字延迟
+            await asyncio.sleep(min(3.5, 0.8 + len(reply) * 0.04 + random.random()))
+            await self.send_group(group_id, reply, at_users=[sender_id],
+                                  quote_message_id=int(msg.get("id") or 0) or None)
+        except Exception:
+            logger.exception("AI 对话出错")
+
+    async def _memory_loop(self):
+        """定期把各群未整理消息交给 AI 归纳进记忆池。"""
+        while not self._shutdown.is_set():
+            try:
+                await asyncio.wait_for(self._shutdown.wait(), timeout=60)
+                return
+            except asyncio.TimeoutError:
+                pass
+            except asyncio.CancelledError:
+                return
+            try:
+                for gid in self.memory.all_groups():
+                    if self.memory.pending_count(gid) >= self.memory.summarize_threshold:
+                        n = await self.human_ai.summarize_pending(gid)
+                        if n:
+                            logger.info("群 %s 记忆池新增 %s 条", gid, n)
+            except Exception:
+                logger.exception("记忆整理任务出错")
 
     # ---------------- 审核 ----------------
     def _should_skip(self, sender_id: int, group_id: int) -> bool:
@@ -1574,6 +1658,7 @@ class GroupModerationBot:
     async def cmd_status(self, msg, is_group, group_id, sender_id, args):
         s = self.stats
         cs = self.complaints.stats()
+        ms = self.memory.stats()
         uptime = int(time.time() - self.start_time)
         h, m = uptime // 3600, uptime % 3600 // 60
         ai_total = self.ai.confirmed_count + self.ai.overturned_count
@@ -1586,6 +1671,7 @@ class GroupModerationBot:
             f"  命令: 禁言 {s['mute_commands']} 次 / 解禁 {s['unmute_commands']} 次",
             f"  举报: 总 {cs['total']}，成功 {cs['success']}（{cs['rate']:.0f}%），24h {cs['day_count']}",
             f"  活跃定时解禁任务: {len(self.unmute_tasks)}",
+            f"  记忆池: {ms['groups']} 群 {ms['memories']} 条 | AI 对话: {self.human_ai.chat_count} 次",
             f"  签到: {'开启' if self._runtime_punch_enabled else '关闭'}，今日 {self.punch.today_count()} 人",
             f"  运行时间: {h} 小时 {m} 分",
         ]
@@ -1697,6 +1783,8 @@ class GroupModerationBot:
 
     async def send_group(self, group_id: int, text: str, at_users: Optional[List[int]] = None,
                          quote_message_id: Optional[int] = None):
+        if self.config.signature_enabled:
+            text = append_signature(text)
         for i, part in enumerate(self.split_reply(text, self.config.reply_max_length)):
             try:
                 await self.im.asend_group_raw(
@@ -1714,6 +1802,8 @@ class GroupModerationBot:
             await self.send_group(group_id, text)
         else:
             sender = int(msg.get("sendId") or 0)
+            if self.config.signature_enabled:
+                text = append_signature(text)
             for part in self.split_reply(text, self.config.reply_max_length):
                 try:
                     await self.im.asend_text(sender, part)
@@ -1755,6 +1845,15 @@ class GroupModerationBot:
         self.unmute_tasks.clear()
         if self._cleanup_task and not self._cleanup_task.done():
             self._cleanup_task.cancel()
+        try:
+            if self.web:
+                await self.web.stop()
+        except Exception:
+            pass
+        try:
+            await self.human_ai.close()
+        except Exception:
+            pass
         await self.detector.close()
         await self.ai.close()
         self._print_final_stats()

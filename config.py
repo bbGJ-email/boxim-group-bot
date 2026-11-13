@@ -74,6 +74,20 @@ class BotConfig:
     punch_streak_bonus_cap: int = 5
     punch_data_file: str = os.environ.get("PUNCH_DATA_FILE", "punch_data.json")
 
+    # ---- AI 拟人对话 & 记忆池 ----
+    ai_chat_enabled: bool = os.environ.get("AI_CHAT_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+    ai_chat_names: List[str] = field(default_factory=lambda: [
+        x.strip() for x in os.environ.get("AI_CHAT_NAMES", "zjhzjhzjh,小z").split(",") if x.strip()
+    ])   # 群里喊这些名字也会触发 AI 对话
+    memory_data_file: str = os.environ.get("MEMORY_DATA_FILE", "memory_data.json")
+    memory_summarize_threshold: int = 10     # 累计 N 条未整理消息触发 AI 归纳
+
+    # ---- Web 控制台 ----
+    web_enabled: bool = os.environ.get("WEB_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+
+    # ---- 制作声明 ----
+    signature_enabled: bool = os.environ.get("SIGNATURE_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+
     # ---- 其它 ----
     stats_group_messages: bool = True        # 消息中间件统计群消息
     reply_max_length: int = 500              # 超过则按行分段

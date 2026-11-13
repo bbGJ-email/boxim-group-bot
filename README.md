@@ -31,6 +31,27 @@
 ### 每日签到 `/punch`
 - 连续天数、累计积分、随机积分、今日第 N 位、签到排行，JSON 持久化，可开关
 
+### AI 拟人对话（群内）
+- 触发：@机器人 / 回复机器人的消息 / 喊它的名字（默认 `小z`，`AI_CHAT_NAMES` 可配）
+- **超拟人提示词 + 反去AI味提示词**双重约束：短句口语、玩梗接梗、禁列表/客套/升华/书面语，输出前再做兜底清洗
+- 每个群独立短期上下文（最近 12 条）+ 记忆池
+
+### 群聊记忆池
+- 每条群消息实时进入该群的当天记忆（原文留存）
+- 累计 10 条未整理消息自动交给 AI 归纳成条目，进入长期记忆池（JSON 持久化，每群上限 400 条）
+- AI 回复时可调用 `search_memory` Agent 工具检索长期记忆（2-gram 关键词 + 时间衰减加权）；当天记录直接注入提示词
+
+### Web 控制台
+- 机器人进程内置 HTTP 服务（默认 `:8901`，`WEB_PORT` 可配）
+- 查看机器人账号下**所有群聊和私聊**的聊天记录（自动跟随最新消息）
+- 以机器人身份**手动发送消息**（不走审核/命令等机器人逻辑）
+- 访问：`http://服务器IP:8901/?token=你的WEB_TOKEN`（`bot.env` 中配置，务必修改）
+
+### 制作声明
+- 机器人**账号签名**自动设置为声明（启动时同步）
+- 所有机器人发出的消息自动追加声明尾缀（`SIGNATURE_ENABLED` 可关）
+- Web 控制台页头展示声明与开源地址
+
 ## 管理员命令
 
 | 命令 | 说明 |
@@ -67,6 +88,8 @@ export AI_API_URL=https://api.openai.com/v1/chat/completions
 export AI_API_KEY=sk-xxx
 export AI_MODEL_ID=gpt-4o-mini
 export SENSITIVE_ACTION=recall_warn               # warn=仅警告 / recall_warn=撤回+警告
+export WEB_TOKEN=改成随机长字符串                  # Web 控制台访问令牌（必改！）
+export WEB_PORT=8901
 
 python3 bot.py        # 前台运行
 ./run.sh              # 后台运行
