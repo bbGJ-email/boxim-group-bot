@@ -80,7 +80,7 @@ class BotConfig:
         x.strip() for x in os.environ.get("AI_CHAT_NAMES", "zjhzjhzjh,小z").split(",") if x.strip()
     ])   # 群里喊这些名字也会触发 AI 对话
     memory_data_file: str = os.environ.get("MEMORY_DATA_FILE", "memory_data.json")
-    memory_summarize_threshold: int = 10     # 累计 N 条未整理消息触发 AI 归纳
+    memory_summarize_threshold: int = 5      # 累计 N 条未整理消息触发 AI 归纳
 
     # ---- Web 控制台 ----
     web_enabled: bool = os.environ.get("WEB_ENABLED", "true").lower() in ("1", "true", "yes", "on")

@@ -12,6 +12,7 @@ import os
 import random
 import re
 import time
+import zoneinfo
 from collections import deque
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -24,6 +25,21 @@ try:
     from boxim.util.core.types import MessageType
 except ImportError:    # pragma: no cover
     MessageType = None
+
+# met.no 天气符号代码 → 中文（取 _ 前的主体部分匹配）
+SYMBOL_CN = {
+    "clearsky": "晴", "fair": "晴", "partlycloudy": "多云", "cloudy": "阴",
+    "lightrain": "小雨", "rain": "中雨", "heavyrain": "大雨",
+    "lightrainshowers": "阵雨", "rainshowers": "阵雨", "heavyrainshowers": "强阵雨",
+    "lightsnow": "小雪", "snow": "中雪", "heavysnow": "大雪", "snowshowers": "阵雪",
+    "heavysnowshowers": "大雪", "lightsnowshowers": "小雪",
+    "sleet": "雨夹雪", "lightsleet": "雨夹雪", "heavysleet": "雨夹雪",
+    "lightsleetshowers": "雨夹雪", "sleetshowers": "雨夹雪", "heavysleetshowers": "雨夹雪",
+    "fog": "雾", "thunderstorm": "雷阵雨", "thunder": "雷阵雨",
+    "lightrainandthunder": "雷阵雨", "rainandthunder": "雷阵雨",
+    "heavyrainandthunder": "雷阵雨", "lightssleetshowersandthunder": "雷雨夹雪",
+    "lightsnowandthunder": "雷阵雪", "snowandthunder": "雷阵雪",
+}
 
 
 # ---------------- 制作声明 ----------------
@@ -118,6 +134,7 @@ class GroupMemory:
         return [int(k) for k in self._data.keys()]
 
     def today_text(self, group_id: int, limit: int = 40) -> str:
+        """当天消息原文（仅调试用，不进 AI 提示词）。"""
         g = self._group(group_id)
         msgs = g["today"][-limit:]
         if not msgs:
@@ -127,6 +144,18 @@ class GroupMemory:
             hm = datetime.fromtimestamp(m["t"]).strftime("%H:%M")
             lines.append(f"{hm} {m['u']}: {m['c']}")
         return "\n".join(lines)
+
+    def today_memories(self, group_id: int, limit: int = 25) -> List[str]:
+        """今天由 AI 归纳出的记忆条目（不是消息原文）。"""
+        g = self._group(group_id)
+        today = datetime.now().strftime("%Y-%m-%d")
+        out = []
+        for m in reversed(g["memories"]):
+            if datetime.fromtimestamp(m["t"]).strftime("%Y-%m-%d") != today:
+                break
+            out.append(m["text"])
+        out.reverse()
+        return out[-limit:]
 
     def search(self, group_id: int, query: str, top_k: int = 8) -> List[str]:
         """关键词检索长期记忆，带时间衰减加权。"""
@@ -202,22 +231,66 @@ SUMMARIZE_PROMPT = """\
 
 
 class HumanAI:
-    """拟人化群聊 AI，带记忆检索 Agent 工具。"""
+    """拟人化群聊 AI，带 Agent 工具（记忆检索 / 天气 / 联网搜索 / 汇率）。"""
 
-    TOOLS = [{
-        "type": "function",
-        "function": {
-            "name": "search_memory",
-            "description": "在本群的长期记忆池里检索历史信息（人物关系、之前聊过的事、梗）。当你觉得需要回忆过去发生过什么时调用。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "检索关键词，比如人名、事件、事物"},
+    TOOLS = [
+        {
+            "type": "function",
+            "function": {
+                "name": "search_memory",
+                "description": "在本群的长期记忆池里检索历史信息（人物关系、之前聊过的事、梗）。当你觉得需要回忆过去发生过什么时调用。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "检索关键词，比如人名、事件、事物"},
+                    },
+                    "required": ["query"],
                 },
-                "required": ["query"],
             },
         },
-    }]
+        {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "查询某个城市的实时天气和今明两天预报。有人问天气时调用。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "city": {"type": "string", "description": "城市名，比如 北京、深圳、上海"},
+                    },
+                    "required": ["city"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "web_search",
+                "description": "联网搜索资料。遇到你不知道的事实、新闻、人物、术语时调用。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "搜索关键词"},
+                    },
+                    "required": ["query"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_exchange_rate",
+                "description": "查询两种货币之间的实时汇率。有人问汇率时调用。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "from_currency": {"type": "string", "description": "基准货币代码，如 CNY、USD，默认 CNY"},
+                        "to_currency": {"type": "string", "description": "目标货币代码，如 USD、JPY、HKD，默认 USD"},
+                    },
+                },
+            },
+        },
+    ]
 
     def __init__(self, config, im, memory: GroupMemory):
         self.config = config
@@ -245,15 +318,22 @@ class HumanAI:
         h.append(("我" if is_bot else user, text))
 
     def _build_system(self, group_id: int, question: str) -> str:
-        today = self.memory.today_text(group_id)
-        hits = self.memory.search(group_id, question)
+        now = datetime.now()
+        wd = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][now.weekday()]
         parts = [PERSONA_PROMPT, ANTI_AI_PROMPT]
-        parts.append(f"【今天的群聊记录（最新在最后）】\n{today}")
+        parts.append(f"【当前时间】{now.strftime('%Y-%m-%d %H:%M')} {wd}")
+        today_mem = self.memory.today_memories(group_id)
+        if today_mem:
+            parts.append("【今天群里发生的事（AI 归纳）】\n" + "\n".join(today_mem))
+        else:
+            parts.append("（今天群里暂时没有值得记住的事）")
+        hits = self.memory.search(group_id, question)
         if hits:
             parts.append("【长期记忆里相关的回忆】\n" + "\n".join(hits))
         parts.append(
-            "你可以调用工具 search_memory 查更早的记忆；"
-            "但大部分时候直接接话就行，不必每次都查。"
+            "你可以调用工具：search_memory（查本群记忆）、get_weather（查天气）、"
+            "web_search（联网搜资料）、get_exchange_rate（查汇率）。"
+            "需要外部信息时才用，别每次都用；查完用你自己的口吻说人话，禁止报一堆数据像客服。"
         )
         return "\n\n".join(parts)
 
@@ -329,21 +409,18 @@ class HumanAI:
             messages.append(message)
             for tc in tool_calls:
                 fn = (tc.get("function") or {})
-                if fn.get("name") == "search_memory":
+                name = fn.get("name") or ""
+                try:
+                    args = json.loads(fn.get("arguments") or "{}")
+                except Exception:
                     args = {}
-                    try:
-                        args = json.loads(fn.get("arguments") or "{}")
-                    except Exception:
-                        pass
-                    query = str(args.get("query") or question)
-                    hits = self.memory.search(group_id, query)
-                    result = "\n".join(hits) if hits else "没有查到相关记忆"
-                    self.tool_calls += 1
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tc.get("id") or "",
-                        "content": result,
-                    })
+                result = await self._execute_tool(name, args, group_id)
+                self.tool_calls += 1
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.get("id") or "",
+                    "content": result,
+                })
             try:
                 data = await self._chat_request(messages, use_tools)
             except Exception as exc:
@@ -365,6 +442,157 @@ class HumanAI:
         self.remember(group_id, asker, question)
         self.remember(group_id, "我", text, is_bot=True)
         return text
+
+    # ---------------- Agent 工具 ----------------
+    async def _execute_tool(self, name: str, args: dict, group_id: int) -> str:
+        try:
+            if name == "search_memory":
+                query = str(args.get("query") or "")
+                hits = self.memory.search(group_id, query)
+                return "\n".join(hits) if hits else "没有查到相关记忆"
+            if name == "get_weather":
+                return await self._tool_weather(str(args.get("city") or ""))
+            if name == "web_search":
+                return await self._tool_search(str(args.get("query") or ""))
+            if name == "get_exchange_rate":
+                return await self._tool_rate(str(args.get("from_currency") or "CNY"),
+                                             str(args.get("to_currency") or "USD"))
+            return f"未知工具: {name}"
+        except Exception as exc:
+            logger.warning("工具 %s 执行失败: %s", name, exc)
+            return "工具调用失败了"
+
+    async def _tool_weather(self, city: str) -> str:
+        """open-meteo 地理编码 + met.no 天气（均免费无 key）。"""
+        city = city.strip()
+        if not city:
+            return "缺城市名"
+        headers = {"User-Agent": "boxim-group-bot/1.0 github.com/bbGJ-email/boxim-group-bot"}
+        params = {"name": city, "count": 1, "language": "zh", "format": "json"}
+        async with self._session.get("https://geocoding-api.open-meteo.com/v1/search",
+                                     params=params, headers=headers) as resp:
+            d = await resp.json(content_type=None)
+        results = d.get("results") or []
+        if not results:
+            return f"没找到城市「{city}」"
+        loc = results[0]
+        try:
+            tz = zoneinfo.ZoneInfo(loc.get("timezone") or "Asia/Shanghai")
+        except Exception:
+            tz = None
+        params = {"lat": loc["latitude"], "lon": loc["longitude"]}
+        async with self._session.get(
+                "https://api.met.no/weatherapi/locationforecast/2.0/compact",
+                params=params, headers=headers) as resp:
+            if resp.status != 200:
+                return f"天气查询失败（{resp.status}）"
+            d = await resp.json(content_type=None)
+        ts = ((d.get("properties") or {}).get("timeseries")) or []
+        if not ts:
+            return "天气数据为空"
+
+        def sym_cn(code):
+            base = (code or "").split("_")[0]
+            return SYMBOL_CN.get(code) or SYMBOL_CN.get(base) or "未知"
+
+        def to_local(iso):
+            dt = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+            return dt.astimezone(tz) if tz else dt
+
+        # 按当地日期聚合每天最高/最低温，取正午的天气符号
+        daily: Dict[str, Dict[str, Any]] = {}
+        for p in ts:
+            dt = to_local(p.get("time"))
+            data = p.get("data") or {}
+            details = (data.get("instant") or {}).get("details") or {}
+            temp = details.get("air_temperature")
+            nxt = (data.get("next_6_hours") or {}).get("summary") or {}
+            if dt.hour < 6 or dt.hour > 13:      # 只统计白天时段，排除夜间极端值
+                continue
+            key = dt.strftime("%m-%d")
+            slot = daily.setdefault(key, {"min": temp, "max": temp, "sym": nxt.get("symbol_code")})
+            if temp is not None:
+                slot["min"] = temp if slot["min"] is None else min(slot["min"], temp)
+                slot["max"] = temp if slot["max"] is None else max(slot["max"], temp)
+            if dt.hour in (11, 12) and nxt.get("symbol_code"):
+                slot["sym"] = nxt["symbol_code"]
+
+        now = to_local(ts[0]["time"])
+        details = ((ts[0].get("data") or {}).get("instant") or {}).get("details") or {}
+        now_temp = details.get("air_temperature")
+        now_sym = sym_cn((((ts[0].get("data") or {}).get("next_6_hours") or {}).get("summary") or {}).get("symbol_code"))
+        out = [f"{loc.get('name') or city}：{now_sym}，当前 {now_temp}°C"]
+        labels = ["今天", "明天"]
+        for i, (key, slot) in enumerate(sorted(daily.items())[:2]):
+            if i >= 2:
+                break
+            out.append(f"{labels[i]} {sym_cn(slot['sym'])} {slot['min']}~{slot['max']}°C")
+        return "，".join(out)
+
+    async def _tool_search(self, query: str) -> str:
+        """联网搜索：DuckDuckGo 即时答案 → 维基百科中文，两级兜底（均免费无 key）。"""
+        query = query.strip()
+        if not query:
+            return "缺搜索词"
+        headers = {"User-Agent": "boxim-group-bot/1.0 (https://github.com/bbGJ-email/boxim-group-bot)"}
+        # 第一级：DuckDuckGo 即时答案（限流时可能返回 202 + 空壳，视同无结果）
+        try:
+            params = {"q": query, "format": "json", "no_html": 1, "skip_disambig": 1}
+            async with self._session.get("https://api.duckduckgo.com/",
+                                         params=params, headers=headers) as resp:
+                if resp.status in (200, 202):
+                    d = await resp.json(content_type=None)
+                    abstract = str(d.get("AbstractText") or "").strip()
+                    if abstract:
+                        src = d.get("AbstractURL") or ""
+                        return abstract[:400] + (f"（来源: {src}）" if src else "")
+                    lines = []
+
+                    def walk(items):
+                        for it in items:
+                            if isinstance(it, dict) and it.get("Topics"):
+                                walk(it["Topics"])
+                            elif isinstance(it, dict) and it.get("Text"):
+                                lines.append(str(it["Text"])[:120])
+
+                    walk(d.get("RelatedTopics") or [])
+                    if lines:
+                        return "\n".join(lines[:5])
+        except Exception as exc:
+            logger.debug("DDG 搜索失败: %s", exc)
+        # 第二级：维基百科中文（UA 需合规，否则 403）
+        try:
+            async with self._session.get("https://zh.wikipedia.org/w/api.php",
+                                         params={"action": "opensearch", "search": query,
+                                                 "limit": 3, "format": "json"},
+                                         headers=headers) as resp:
+                d2 = await resp.json(content_type=None)
+            if isinstance(d2, list) and len(d2) > 1 and d2[1]:
+                titles, descs = d2[1], (d2[2] if len(d2) > 2 else [])
+                urls = d2[3] if len(d2) > 3 else []
+                out = []
+                for i, title in enumerate(titles[:3]):
+                    desc = str((descs or [""])[i] or "").strip() if i < len(descs or []) else ""
+                    url = (urls or [""])[i] if i < len(urls or []) else ""
+                    line = f"{title}：{desc}" if desc else str(title)
+                    if url:
+                        line += f" {url}"
+                    out.append(line[:200])
+                return "\n".join(out)
+        except Exception as exc:
+            logger.debug("维基搜索失败: %s", exc)
+        return "没搜到什么有用的东西"
+
+    async def _tool_rate(self, base: str, quote: str) -> str:
+        """open.er-api.com 免费汇率（无需 API key）。"""
+        base = (base.strip().upper() or "CNY")[:8]
+        quote = (quote.strip().upper() or "USD")[:8]
+        async with self._session.get(f"https://open.er-api.com/v6/latest/{base}") as resp:
+            d = await resp.json(content_type=None)
+        rates = d.get("rates") or {}
+        if quote not in rates:
+            return f"查不到 {base} → {quote}"
+        return f"1 {base} ≈ {rates[quote]} {quote}（汇率仅供参考）"
 
     async def summarize_pending(self, group_id: int) -> int:
         """把待整理消息交给 AI 汇总进记忆池，返回新增条数。"""

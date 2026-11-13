@@ -735,7 +735,8 @@ class GroupModerationBot:
             # 拟人打字延迟
             await asyncio.sleep(min(3.5, 0.8 + len(reply) * 0.04 + random.random()))
             await self.send_group(group_id, reply, at_users=[sender_id],
-                                  quote_message_id=int(msg.get("id") or 0) or None)
+                                  quote_message_id=int(msg.get("id") or 0) or None,
+                                  signature=False)
         except Exception:
             logger.exception("AI 对话出错")
 
@@ -1782,8 +1783,8 @@ class GroupModerationBot:
         return chunks
 
     async def send_group(self, group_id: int, text: str, at_users: Optional[List[int]] = None,
-                         quote_message_id: Optional[int] = None):
-        if self.config.signature_enabled:
+                         quote_message_id: Optional[int] = None, signature: bool = True):
+        if self.config.signature_enabled and signature:
             text = append_signature(text)
         for i, part in enumerate(self.split_reply(text, self.config.reply_max_length)):
             try:
