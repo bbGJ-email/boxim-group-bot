@@ -17,7 +17,7 @@ import re
 import signal
 import sys
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
@@ -593,6 +593,8 @@ class GroupModerationBot:
         self._runtime_punch_enabled = config.punch_enabled
         self._name_cache: Dict[str, Tuple[int, str]] = {}       # 名称解析缓存 u:/g: 前缀
         self._nick_cache: Dict[int, str] = {}                   # user_id -> 昵称
+        self._flood: Dict[Tuple[int, int], deque] = defaultdict(deque)          # (group, user) -> [(ts, content)]
+        self._flood_warn_ts: Dict[Tuple[int, int], float] = {}  # 上次刷屏警告时间
 
         # 运行统计
         self.stats = {
@@ -604,6 +606,7 @@ class GroupModerationBot:
             "unmuted_users": 0,
             "mute_commands": 0,
             "unmute_commands": 0,
+            "flood_triggered": 0,
         }
         self.start_time = time.time()
         self._cleanup_task: Optional[asyncio.Task] = None
@@ -645,6 +648,7 @@ class GroupModerationBot:
         print(f"  禁言时长梯度: {cfg.mute_durations} 秒")
         print(f"  自动解禁: {'开' if cfg.auto_unmute_enabled else '关'}")
         print(f"  自动举报: {'开' if cfg.auto_complaint_enabled else '关'}")
+        print(f"  刷屏检测: {'开' if cfg.flood_enabled else '关'}（{cfg.flood_window} 秒 {cfg.flood_max_messages} 条 / 重复 {cfg.flood_max_repeat} 次 → {cfg.flood_action}）")
         print(f"  每日签到: {'开' if cfg.punch_enabled else '关'}")
         print(f"  管理员: {cfg.admin_ids}")
         print("=" * 50)
@@ -685,6 +689,54 @@ class GroupModerationBot:
             return True
         return False
 
+    async def _check_flood(self, msg: dict, sender_id: int, group_id: int, content: str) -> bool:
+        """刷屏检测：窗口内消息过多或相同内容连发。返回 True 表示已处理。"""
+        cfg = self.config
+        key = (group_id, sender_id)
+        now = time.time()
+        dq = self._flood[key]
+        dq.append((now, content))
+        while dq and now - dq[0][0] > cfg.flood_window:
+            dq.popleft()
+
+        recent = [c for t, c in dq if now - t <= cfg.flood_window]
+        repeat = sum(1 for c in recent if c == content)
+        if len(recent) < cfg.flood_max_messages and repeat < cfg.flood_max_repeat:
+            return False
+
+        # 警告冷却，避免每次消息都告警
+        last = self._flood_warn_ts.get(key, 0)
+        if now - last < cfg.flood_warn_cooldown:
+            return True
+        self._flood_warn_ts[key] = now
+        dq.clear()
+        self.stats["flood_triggered"] += 1
+
+        nick = await self.get_nickname(sender_id, str(msg.get("sendNickName") or ""))
+        if len(recent) >= cfg.flood_max_messages:
+            reason = f"{len(recent)} 条消息 / {cfg.flood_window} 秒"
+        else:
+            reason = f"相同内容连续发送 {repeat} 次"
+        lines = [
+            "📢 检测到刷屏行为，请慢一点发言！",
+            f"👤 用户: @{nick}（ID: {sender_id}）",
+            f"📈 刷屏特征: {reason}",
+        ]
+
+        is_bot_admin = await self.is_bot_group_admin(group_id)
+        if is_bot_admin and cfg.flood_action == "mute":
+            lines.append(f"🔇 已禁言 {self._fmt_duration(cfg.flood_mute_seconds)}")
+            await self.mute_user(group_id, sender_id, duration=cfg.flood_mute_seconds,
+                                 reason=f"刷屏（{reason}）", user_name=nick)
+            await self.send_group(group_id, "\n".join(lines), at_users=[sender_id])
+        else:
+            if not is_bot_admin:
+                lines.append("ℹ️ 机器人非本群管理员，仅警告")
+            await self.send_group(group_id, "\n".join(lines),
+                                  at_users=[sender_id],
+                                  quote_message_id=int(msg.get("id") or 0) or None)
+        return True
+
     async def moderate_group_message(self, msg: dict, msg_type: int, sender_id: int, group_id: int, content: str):
         if msg_type != 0:          # 只审文本
             return
@@ -693,6 +745,10 @@ class GroupModerationBot:
         if self._should_skip(sender_id, group_id):
             return
         self.stats["checked_messages"] += 1
+
+        # 刷屏检测（触发即处理，不再进入敏感词链路）
+        if self.config.flood_enabled and await self._check_flood(msg, sender_id, group_id, content):
+            return
 
         # BoxIM 服务端会先把敏感词打码成 *** 再下发，机器人收到的是掩码文本。
         # 含连续 *** 说明服务端已判定违规，直接处理，不必再过 AI/词库
@@ -1524,7 +1580,7 @@ class GroupModerationBot:
         lines = [
             "📊 机器人状态:",
             f"  已检查消息: {s['checked_messages']} | 群消息: {s['group_messages']}",
-            f"  敏感检测: {s['sensitive_detected']} | 撤回: {s['recalled']}",
+            f"  敏感检测: {s['sensitive_detected']} | 撤回: {s['recalled']} | 刷屏处置: {s['flood_triggered']}",
             f"  AI: 检查 {self.ai.check_count} 次，确认 {self.ai.confirmed_count}，推翻 {self.ai.overturned_count}",
             f"  禁言: {s['muted_users']} 人 | 解禁: {s['unmuted_users']} 人",
             f"  命令: 禁言 {s['mute_commands']} 次 / 解禁 {s['unmute_commands']} 次",
@@ -1560,6 +1616,7 @@ class GroupModerationBot:
             "",
             "⚙️ 自动功能:",
             "  敏感内容审核 → 警告 → 撤回 → 累计禁言 → 自动举报",
+            "  刷屏检测 → 警告 → 自动禁言（10 秒 5 条或同内容连发 3 次）",
             "  禁言到期自动解禁（永久禁言除外）",
             "  提示: 用户参数支持 用户名/昵称（带@也行），群参数支持群名",
         ]

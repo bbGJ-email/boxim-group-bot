@@ -28,6 +28,15 @@ class BotConfig:
     violation_data_file: str = os.environ.get("VIOLATION_DATA_FILE", "violation_data.json")
     mute_durations: List[int] = field(default_factory=lambda: [60, 300, 1800, 7200])  # 秒
 
+    # ---- 刷屏检测 ----
+    flood_enabled: bool = os.environ.get("FLOOD_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+    flood_window: int = 10                # 统计窗口（秒）
+    flood_max_messages: int = 5           # 窗口内最大消息数
+    flood_max_repeat: int = 3             # 相同内容连续次数
+    flood_action: str = os.environ.get("FLOOD_ACTION", "mute")   # warn=仅警告 mute=警告+禁言
+    flood_mute_seconds: int = 300         # 触发后禁言时长
+    flood_warn_cooldown: int = 60         # 同一用户警告冷却（秒）
+
     # ---- 处理 ----
     sensitive_action: str = os.environ.get("SENSITIVE_ACTION", "recall_warn")   # warn=仅警告 recall_warn=撤回+警告
     trigger_char: str = "/"
