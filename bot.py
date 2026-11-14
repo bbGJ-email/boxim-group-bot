@@ -817,6 +817,23 @@ class GroupModerationBot:
         try:
             question = re.sub(r"^@\S+\s*", "", content, count=1).strip() or content
 
+            # 引用消息上下文：文本引用拼给 AI；图片引用下载后让 AI 看
+            quote_info = None
+            quote_img = None
+            q = msg.get("quoteMessage") or {}
+            if isinstance(q, dict):
+                qnick = str(q.get("sendNickName") or "")
+                qcontent = str(q.get("content") or "").strip()
+                if int(q.get("type") or 0) == 1:
+                    qurl = self._extract_image_url(qcontent)
+                    quote_img = await self._fetch_image_data_url(qurl) if qurl else None
+                    if quote_img:
+                        quote_info = (qnick, "[图片]")
+                elif qcontent and int(q.get("sendId") or 0) != self.bot_id:
+                    # 引用机器人自己的消息不用传（AI 的历史里已有），其他消息打码占位后传入
+                    qcontent = re.sub(r"\*{3,}", "（违规内容已屏蔽）", qcontent)
+                    quote_info = (qnick, qcontent[:500])
+
             # AI 触发刷屏检测：疯狂 @机器人 / 反复回复机器人同样算刷屏
             if self.config.flood_enabled and not self._should_skip(sender_id, group_id):
                 if await self._check_flood(msg, sender_id, group_id, content):
@@ -834,7 +851,9 @@ class GroupModerationBot:
                     return
 
             nick = str(msg.get("sendNickName") or sender_id)
-            reply = await self.human_ai.chat(group_id, nick, question)
+            reply = await self.human_ai.chat(group_id, nick, question,
+                                             image_data_url=quote_img,
+                                             quote_info=quote_info)
             logger.info("AI 对话触发: 群=%s 问=%r → %r", group_id, question[:30], (reply or "")[:50])
             if not reply:
                 return
@@ -985,7 +1004,18 @@ class GroupModerationBot:
                     and group_id not in self.config.whitelist_groups:
                 if not data_url:
                     return
-                reply = await self.human_ai.chat(group_id, nick, "", image_data_url=data_url)
+                # 附带的文本引用（引用别人的文字同时发图 @机器人）
+                quote_info = None
+                q = msg.get("quoteMessage") or {}
+                if isinstance(q, dict) and int(q.get("type") or 0) != 1 \
+                        and int(q.get("sendId") or 0) != self.bot_id:
+                    qcontent = re.sub(r"\*{3,}", "（违规内容已屏蔽）",
+                                      str(q.get("content") or "").strip())
+                    if qcontent:
+                        quote_info = (str(q.get("sendNickName") or ""), qcontent[:500])
+                reply = await self.human_ai.chat(group_id, nick, "",
+                                                 image_data_url=data_url,
+                                                 quote_info=quote_info)
                 logger.info("AI 看图触发: 群=%s 发图=%s → %r", group_id, nick, (reply or "")[:50])
                 if reply:
                     await asyncio.sleep(min(3.5, 0.8 + len(reply) * 0.04 + random.random()))

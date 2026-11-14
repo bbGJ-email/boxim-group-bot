@@ -454,7 +454,8 @@ class HumanAI:
 
     def _build_messages(self, group_id: int, asker: str, question: str,
                         extra_memory: Optional[List[str]] = None,
-                        image_data_url: Optional[str] = None) -> List[Dict[str, Any]]:
+                        image_data_url: Optional[str] = None,
+                        quote_info: Optional[Tuple[str, str]] = None) -> List[Dict[str, Any]]:
         system = self._build_system(group_id, question)
         if extra_memory:
             system += "\n【补充记忆检索结果】\n" + "\n".join(extra_memory)
@@ -463,17 +464,30 @@ class HumanAI:
             role = "assistant" if user == "我" else "user"
             content = text if role == "assistant" else f"{user} 说：{text}"
             msgs.append({"role": role, "content": content})
+        # 引用上下文：被引用的文本（图片引用时是占位说明，图片本体在最后一条消息里）
+        quote_prefix = ""
+        if quote_info:
+            qnick, qcontent = quote_info
+            if qcontent:
+                quote_prefix = f"{asker} 引用了 {qnick or '某人'} 的消息：「{qcontent}」"
         if image_data_url:
             # 看图模式：最后一条 user 消息为多模态（文本 + 图片）
             prompt = f"{asker} 发了一张图片给你"
             if question and question.strip():
                 prompt += f"，并说：{question}"
+            if quote_prefix:
+                prompt = quote_prefix + "\n" + prompt
             msgs.append({"role": "user", "content": [
                 {"type": "text", "text": prompt},
                 {"type": "image_url", "image_url": {"url": image_data_url}},
             ]})
         else:
-            msgs.append({"role": "user", "content": f"{asker} 对你说：{question}"})
+            if quote_prefix and not (question and question.strip()):
+                msgs.append({"role": "user", "content": f"{quote_prefix}，让你看看这条消息"})
+            elif quote_prefix:
+                msgs.append({"role": "user", "content": f"{quote_prefix}\n{asker} 对你说：{question}"})
+            else:
+                msgs.append({"role": "user", "content": f"{asker} 对你说：{question}"})
         return msgs
 
     async def _chat_request(self, messages: List[Dict[str, Any]], use_tools: bool) -> Dict[str, Any]:
@@ -498,15 +512,17 @@ class HumanAI:
             return data
 
     async def chat(self, group_id: int, asker: str, question: str,
-                   image_data_url: Optional[str] = None) -> Optional[str]:
-        """生成拟人化回复，带 Agent 记忆检索。image_data_url 传入图片（data URL）时以看图模式回复。"""
+                   image_data_url: Optional[str] = None,
+                   quote_info: Optional[Tuple[str, str]] = None) -> Optional[str]:
+        """生成拟人化回复，带 Agent 记忆检索。image_data_url 为图片（data URL），quote_info=(引用者昵称, 引用内容)。"""
         await self._ensure_session()
         now = time.time()
         if now - self._cooldown.get(group_id, 0) < 5:
             return None
         self._cooldown[group_id] = now
 
-        messages = self._build_messages(group_id, asker, question, image_data_url=image_data_url)
+        messages = self._build_messages(group_id, asker, question,
+                                        image_data_url=image_data_url, quote_info=quote_info)
         use_tools = self._tools_ok is not False
 
         try:
