@@ -453,7 +453,8 @@ class HumanAI:
         return "\n\n".join(parts)
 
     def _build_messages(self, group_id: int, asker: str, question: str,
-                        extra_memory: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+                        extra_memory: Optional[List[str]] = None,
+                        image_data_url: Optional[str] = None) -> List[Dict[str, Any]]:
         system = self._build_system(group_id, question)
         if extra_memory:
             system += "\n【补充记忆检索结果】\n" + "\n".join(extra_memory)
@@ -462,7 +463,17 @@ class HumanAI:
             role = "assistant" if user == "我" else "user"
             content = text if role == "assistant" else f"{user} 说：{text}"
             msgs.append({"role": role, "content": content})
-        msgs.append({"role": "user", "content": f"{asker} 对你说：{question}"})
+        if image_data_url:
+            # 看图模式：最后一条 user 消息为多模态（文本 + 图片）
+            prompt = f"{asker} 发了一张图片给你"
+            if question and question.strip():
+                prompt += f"，并说：{question}"
+            msgs.append({"role": "user", "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": image_data_url}},
+            ]})
+        else:
+            msgs.append({"role": "user", "content": f"{asker} 对你说：{question}"})
         return msgs
 
     async def _chat_request(self, messages: List[Dict[str, Any]], use_tools: bool) -> Dict[str, Any]:
@@ -486,15 +497,16 @@ class HumanAI:
                 raise RuntimeError(f"AI API {resp.status}: {str(data)[:120]}")
             return data
 
-    async def chat(self, group_id: int, asker: str, question: str) -> Optional[str]:
-        """生成拟人化回复，带 Agent 记忆检索。返回最终文本。"""
+    async def chat(self, group_id: int, asker: str, question: str,
+                   image_data_url: Optional[str] = None) -> Optional[str]:
+        """生成拟人化回复，带 Agent 记忆检索。image_data_url 传入图片（data URL）时以看图模式回复。"""
         await self._ensure_session()
         now = time.time()
         if now - self._cooldown.get(group_id, 0) < 5:
             return None
         self._cooldown[group_id] = now
 
-        messages = self._build_messages(group_id, asker, question)
+        messages = self._build_messages(group_id, asker, question, image_data_url=image_data_url)
         use_tools = self._tools_ok is not False
 
         try:
@@ -1157,11 +1169,21 @@ class WebConsole:
             except Exception:
                 tstr = ""
             sender = d.get("sendId")
+            mtype = d.get("type", 0)
+            text = str(d.get("content") or "")[:2000]
+            if mtype == 1:
+                text = "[图片] " + text
+            elif mtype == 3:
+                text = "[语音] " + text
+            elif mtype == 4:
+                text = "[视频] " + text
+            elif mtype == 7:
+                text = "[表情包]"
             out.append({
                 "id": d.get("id"),
                 "seqNo": d.get("seqNo") or d.get("id"),
                 "nick": d.get("sendNickName") or str(sender),
-                "text": str(d.get("content") or "")[:2000],
+                "text": text,
                 "time": tstr,
                 "self": sender == bot_id,
                 "deleted": bool(d.get("deleted")),

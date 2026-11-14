@@ -49,6 +49,7 @@ class BotConfig:
 
     # ---- AI 复检（OpenAI 协议）----
     ai_recheck_enabled: bool = os.environ.get("AI_RECHECK_ENABLED", "false").lower() in ("1", "true", "yes", "on")
+    ai_image_check_enabled: bool = os.environ.get("AI_IMAGE_CHECK_ENABLED", "true").lower() in ("1", "true", "yes", "on")
     ai_api_url: str = os.environ.get("AI_API_URL", "https://api.openai.com/v1/chat/completions")
     ai_api_key: str = os.environ.get("AI_API_KEY", "")
     ai_model_id: str = os.environ.get("AI_MODEL_ID", "gpt-4o-mini")

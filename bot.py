@@ -9,6 +9,7 @@
 - /punch 每日签到
 """
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -278,6 +279,64 @@ class AIContentChecker:
             else:
                 self.overturned_count += 1
                 result["reason"] = f"AI 判定安全（置信度 {confidence:.0%}）"
+        except Exception as exc:
+            self.error_count += 1
+            self._consecutive_errors += 1
+            result["reason"] = f"AI 请求失败: {exc}"
+            if self._consecutive_errors >= self.config.ai_max_consecutive_errors:
+                self._disabled_until = time.time() + self.config.ai_error_disable_seconds
+                self._consecutive_errors = 0
+                logger.warning("AI 连续出错，禁用 %s 秒", self.config.ai_error_disable_seconds)
+        return result
+
+    async def check_image(self, image_data_url: str) -> Dict[str, Any]:
+        """看图审核：让视觉模型判断图片是否违规，只回答 是/否。"""
+        result: Dict[str, Any] = {
+            "is_sensitive": False, "confidence": 0.0, "reason": "",
+            "raw_response": "", "success": False,
+        }
+        if not self.available:
+            result["reason"] = "AI 检查器暂时禁用中（连续错误）"
+            return result
+        await self._ensure_session()
+        payload = {
+            "model": self.config.ai_model_id,
+            "messages": [
+                {"role": "system", "content": self.SYSTEM_PROMPT},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "审核这张图片。敏感回答「是」，安全回答「否」，只回答一个字。"},
+                    {"type": "image_url", "image_url": {"url": image_data_url}},
+                ]},
+            ],
+            "stream": False,
+            "temperature": 0,
+            "max_tokens": 8,
+        }
+        headers = {
+            "Authorization": f"Bearer {self.config.ai_api_key}",
+            "Content-Type": "application/json",
+        }
+        self.check_count += 1
+        try:
+            async with self._session.post(
+                self.config.ai_api_url, json=payload, headers=headers
+            ) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    raise RuntimeError(f"HTTP {resp.status}: {body[:120]}")
+                d = await resp.json(content_type=None)
+            self._consecutive_errors = 0
+            text = str((((d.get("choices") or [{}])[0]).get("message") or {}).get("content") or "")
+            result["raw_response"] = text
+            is_sensitive, confidence = self.parse_answer(text)
+            result["is_sensitive"] = is_sensitive
+            result["confidence"] = confidence
+            result["success"] = True
+            result["reason"] = (f"AI 判定{'敏感' if is_sensitive else '安全'}（置信度 {confidence:.0%}）")
+            if is_sensitive:
+                self.confirmed_count += 1
+            else:
+                self.overturned_count += 1
         except Exception as exc:
             self.error_count += 1
             self._consecutive_errors += 1
@@ -719,6 +778,11 @@ class GroupModerationBot:
                 self.memory.add_message(group_id, nick, content)
                 self.human_ai.remember(group_id, nick, content)
 
+            # 图片消息：进记忆 + AI 看图对话 + 图片审核
+            if msg_type == 1:
+                await self._handle_image_message(msg, sender_id, group_id, content)
+                return
+
             # AI 拟人对话：@机器人 或 回复机器人（群内）
             if msg_type == 0 and content.strip() and sender_id != self.bot_id \
                     and self.config.ai_chat_enabled and group_id not in self.config.whitelist_groups \
@@ -768,6 +832,132 @@ class GroupModerationBot:
                                   signature=False)
         except Exception:
             logger.exception("AI 对话出错")
+
+    # ---------------- 图片消息 ----------------
+    @staticmethod
+    def _extract_image_url(content: str) -> Optional[str]:
+        """从图片消息 content 里提取图片 URL（兼容纯 URL / JSON 结构 / 相对路径）。"""
+        c = (content or "").strip()
+        if not c:
+            return None
+        if c.startswith("http"):
+            return c.split()[0]
+        # 相对路径（如 /api/image/xxx.jpg）→ 交给 _fetch_image_data_url 拼 base_url
+        if re.match(r"^/[\w\-./]+\.(jpg|jpeg|png|gif|webp|bmp)(\?\S*)?$", c, re.I):
+            return c
+        try:
+            d = json.loads(c)
+        except Exception:
+            return None
+
+        def find(v) -> Optional[str]:
+            if isinstance(v, str):
+                return v.strip() if v.strip() else None
+            if isinstance(v, dict):
+                for k in ("url", "imageUrl", "imgUrl", "fileUrl", "path", "thumbUrl"):
+                    if k in v and isinstance(v[k], str) and v[k].strip():
+                        return v[k].strip()
+                for x in v.values():
+                    r = find(x)
+                    if r:
+                        return r
+            if isinstance(v, list):
+                for x in v:
+                    r = find(x)
+                    if r:
+                        return r
+            return None
+
+        return find(d)
+
+    async def _fetch_image_data_url(self, url: str) -> Optional[str]:
+        """下载图片转 base64 data URL（供视觉模型），失败返回 None。"""
+        if not url:
+            return None
+        if url.startswith("data:"):
+            return url
+        if url.startswith("/"):
+            url = self.config.base_url.rstrip("/") + url
+        await self.human_ai._ensure_session()
+        headers = {}
+        try:
+            token = self.im._http._resolve_access_token()
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+        except Exception:
+            pass
+        try:
+            async with self.human_ai._session.get(
+                    url, headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                if resp.status != 200:
+                    # 不带 token 再试一次
+                    async with self.human_ai._session.get(
+                            url, timeout=aiohttp.ClientTimeout(total=15)) as resp2:
+                        if resp2.status != 200:
+                            logger.warning("图片下载失败 %s: HTTP %s", url[:80], resp2.status)
+                            return None
+                        body, ctype = await resp2.read(), resp2.headers.get("Content-Type", "")
+                else:
+                    body, ctype = await resp.read(), resp.headers.get("Content-Type", "")
+        except Exception as exc:
+            logger.warning("图片下载异常 %s: %s", url[:80], exc)
+            return None
+        if len(body) > 6 * 1024 * 1024:
+            logger.warning("图片过大，跳过识别: %s", url[:80])
+            return None
+        if not ctype.startswith("image/"):
+            ctype = "image/png" if url.lower().endswith(".png") else "image/jpeg"
+        return f"data:{ctype};base64,{base64.b64encode(body).decode()}"
+
+    async def _handle_image_message(self, msg: dict, sender_id: int, group_id: int, content: str):
+        """图片消息：进记忆池、AI 看图对话、AI 看图审核。"""
+        try:
+            nick = str(msg.get("sendNickName") or sender_id)
+            img_url = self._extract_image_url(content)
+            data_url = await self._fetch_image_data_url(img_url) if img_url else None
+
+            # 记忆池 / 短期上下文：图片以占位符记录（文本归纳时 AI 能感知有人发过图）
+            self.memory.add_message(group_id, nick, "[图片]")
+            self.human_ai.remember(group_id, nick, "[图片]")
+
+            # AI 触发：@机器人 / 回复机器人
+            quote = msg.get("quoteMessage") or {}
+            at_me = isinstance(msg.get("atUserIds"), list) and self.bot_id in msg["atUserIds"]
+            reply_me = isinstance(quote, dict) and quote.get("sendId") == self.bot_id
+
+            # 图片审核（AI 视觉）
+            image_result = None
+            if self.config.ai_image_check_enabled and data_url and not self._should_skip(sender_id, group_id):
+                image_result = await self.ai.check_image(data_url)
+                if image_result.get("success") and image_result.get("is_sensitive"):
+                    self.stats["sensitive_detected"] += 1
+                    logger.info("图片审核命中（违规）: 发送者=%s 群=%s", sender_id, group_id)
+                    fake_detection = {
+                        "is_sensitive": True,
+                        "sensitive_words": ["违规图片"],
+                        "masked_text": "[图片]",
+                        "positions": [],
+                        "hit_types": ["图片违规"],
+                        "error": None,
+                    }
+                    await self.handle_violation(msg, sender_id, group_id, "[图片]", fake_detection, None)
+                    return
+
+            # @机器人发图 → AI 看图回复
+            if (at_me or reply_me) and self.config.ai_chat_enabled \
+                    and group_id not in self.config.whitelist_groups:
+                if not data_url:
+                    return
+                reply = await self.human_ai.chat(group_id, nick, "", image_data_url=data_url)
+                logger.info("AI 看图触发: 群=%s 发图=%s → %r", group_id, nick, (reply or "")[:50])
+                if reply:
+                    await asyncio.sleep(min(3.5, 0.8 + len(reply) * 0.04 + random.random()))
+                    await self.send_group(group_id, reply, at_users=[sender_id],
+                                          quote_message_id=int(msg.get("id") or 0) or None,
+                                          signature=False)
+        except Exception:
+            logger.exception("图片消息处理出错")
 
     async def _memory_loop(self):
         """定期把各群未整理消息交给 AI 归纳进记忆池。"""
