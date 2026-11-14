@@ -724,9 +724,18 @@ class GroupModerationBot:
             logger.exception("处理消息出错")
 
     async def _handle_ai_chat(self, msg: dict, sender_id: int, group_id: int, content: str):
-        """@机器人 / 回复机器人 → 拟人化 AI 对话。"""
+        """@机器人 / 回复机器人 → 拟人化 AI 对话（发给 AI 的内容同样过审核）。"""
         try:
             question = re.sub(r"^@\S+\s*", "", content, count=1).strip() or content
+
+            # 发给 AI 的内容也要审核：命中敏感词按违规处理，不再进行 AI 对话
+            detection = await self.detector.check(question)
+            if not detection.get("error") and detection.get("is_sensitive"):
+                self.stats["sensitive_detected"] += 1
+                logger.info("AI 对话输入命中敏感词，转违规处理: %r", (detection.get("sensitive_words") or [])[:3])
+                await self.handle_violation(msg, sender_id, group_id, question, detection, None)
+                return
+
             nick = str(msg.get("sendNickName") or sender_id)
             reply = await self.human_ai.chat(group_id, nick, question)
             logger.info("AI 对话触发: 群=%s 问=%r → %r", group_id, question[:30], (reply or "")[:50])
