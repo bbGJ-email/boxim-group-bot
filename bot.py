@@ -746,13 +746,15 @@ class GroupModerationBot:
         try:
             question = re.sub(r"^@\S+\s*", "", content, count=1).strip() or content
 
-            # 发给 AI 的内容也要审核：命中敏感词按违规处理，不再进行 AI 对话
-            detection = await self.detector.check(question)
-            if not detection.get("error") and detection.get("is_sensitive"):
-                self.stats["sensitive_detected"] += 1
-                logger.info("AI 对话输入命中敏感词，转违规处理: %r", (detection.get("sensitive_words") or [])[:3])
-                await self.handle_violation(msg, sender_id, group_id, question, detection, None)
-                return
+            # 发给 AI 的内容也要审核（管理员/白名单豁免）：命中按违规处理，不再进行 AI 对话
+            if not self._should_skip(sender_id, group_id):
+                detection = await self.detector.check(question)
+                if not detection.get("error") and detection.get("is_sensitive"):
+                    self.stats["sensitive_detected"] += 1
+                    logger.info("AI 对话输入命中敏感词，转违规处理: %r",
+                                (detection.get("sensitive_words") or [])[:3])
+                    await self.handle_violation(msg, sender_id, group_id, question, detection, None)
+                    return
 
             nick = str(msg.get("sendNickName") or sender_id)
             reply = await self.human_ai.chat(group_id, nick, question)
@@ -878,13 +880,10 @@ class GroupModerationBot:
             await self.handle_violation(msg, sender_id, group_id, content, detection, None)
             return
 
-        # AI 复检：先 AI 判断，判敏感再走敏感词检测
+        # AI 复检 + 敏感词词库互补：任一命中即处理（AI 判安全不再短路词库）
         ai_result: Optional[Dict[str, Any]] = None
         if self.config.ai_recheck_enabled and self.ai.available:
-            ai_result = await self.ai.check(content)
-            if ai_result["success"] and not ai_result["is_sensitive"]:
-                return    # AI 判安全，不处理
-            # AI 出错则退回敏感词检测
+            ai_result = await self.ai.check(content)    # 出错时内部记录并禁用，结果标 success=False
         elif self.config.ai_recheck_enabled:
             ai_result = {"success": False, "is_sensitive": None, "reason": "AI 禁用中", "confidence": 0, "raw_response": ""}
 
@@ -892,8 +891,12 @@ class GroupModerationBot:
         if detection["error"]:
             logger.warning("敏感词检测失败: %s", detection["error"])
             return
-        if not detection["is_sensitive"]:
+        word_hit = bool(detection.get("is_sensitive"))
+        ai_hit = bool(ai_result and ai_result.get("success") and ai_result.get("is_sensitive"))
+        if not (word_hit or ai_hit):
             return
+        if ai_hit and not word_hit:
+            logger.info("AI 复检命中（词库未命中）: %r", content[:30])
 
         self.stats["sensitive_detected"] += 1
         await self.handle_violation(msg, sender_id, group_id, content, detection, ai_result)
