@@ -799,8 +799,13 @@ class GroupModerationBot:
 
             # 命令优先（文本消息才解析）
             if msg_type == 0 and content.startswith(self.config.trigger_char):
-                await self.handle_command(msg, is_group)
-                return
+                if self._match_command(content):
+                    await self.handle_command(msg, is_group)
+                    return
+                # 「/」开头但不是合法命令 → 当普通文本处理（防止加 / 绕过审核）
+                nick = str(msg.get("sendNickName") or sender_id)
+                self.memory.add_message(group_id, nick, content)
+                self.human_ai.remember(group_id, nick, content)
 
             await self.moderate_group_message(msg, msg_type, sender_id, group_id, content)
         except Exception:
