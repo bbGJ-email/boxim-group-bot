@@ -952,6 +952,9 @@ header{display:flex;align-items:center;gap:10px;padding:10px 16px;background:var
 header b{font-size:15px}
 header .spacer{flex:1}
 header span{color:var(--muted);font-size:12px}
+#botbtn{background:var(--panel2);border:1px solid #2a3440;color:var(--text);border-radius:6px;padding:5px 14px;cursor:pointer;font-size:13px}
+#botbtn:hover{border-color:var(--acc)}
+#botbtn.off{color:var(--ok);border-color:var(--ok)}
 main{flex:1;display:flex;min-height:0}
 aside{width:240px;background:var(--panel);border-right:1px solid #2a3440;display:flex;flex-direction:column}
 .tabs{display:flex}
@@ -976,7 +979,7 @@ footer button{background:var(--acc);border:none;color:#fff;border-radius:8px;pad
 </style>
 </head>
 <body>
-<header><b>🤖 机器人控制台</b><span id="st"></span><div class="spacer"></div>__SIGNATURE_HTML__<span>Web 控制台</span></header>
+<header><b>🤖 机器人控制台</b><span id="st"></span><div class="spacer"></div>__SIGNATURE_HTML__<button id="botbtn" onclick="toggleBot()">⏹ 停止机器人</button><span>Web 控制台</span></header>
 <main>
 <aside>
 <div class="tabs"><button class="on" data-t="group">群聊</button><button data-t="private">私聊</button></div>
@@ -1005,7 +1008,9 @@ async function loadMore(){await loadMsgs(false)}
 async function send(){if(!cur)return;const inp=document.getElementById('input');const c=inp.value.trim();if(!c)return;inp.value='';await api('/api/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({type:tab,id:cur.id,content:c})});setTimeout(()=>loadMsgs(true),600)}
 document.getElementById('sendbtn').onclick=send;
 document.getElementById('input').addEventListener('keydown',e=>{if(e.key==='Enter')send()});
-(async()=>{try{const d=await api('/api/status');document.getElementById('st').textContent='运行 '+d.uptime+' · 已检查 '+d.checked+' · AI对话 '+d.chats}catch(e){}})();
+async function toggleBot(){const b=document.getElementById('botbtn');const stop=b.dataset.running==='1';if(!confirm(stop?'确定停止机器人？停止后将完全断开连接，不再接收和回复任何消息。':'确定启动机器人？将重新连接并恢复消息处理。'))return;await api('/api/bot',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:stop?'stop':'start'})});setTimeout(refreshBot,600)}
+async function refreshBot(){try{const d=await api('/api/status');document.getElementById('st').textContent=(d.running?'运行中':'已停止')+' · '+d.uptime+' · 已检查 '+d.checked+' · AI对话 '+d.chats;const b=document.getElementById('botbtn');b.dataset.running=d.running?'1':'0';b.textContent=d.running?'⏹ 停止机器人':'▶ 启动机器人';b.classList.toggle('off',!d.running)}catch(e){}}
+(async()=>{refreshBot();setInterval(refreshBot,8000)})();
 loadChats();
 </script>
 </body>
@@ -1039,6 +1044,7 @@ class WebConsole:
         app.router.add_get("/api/messages", self._messages)
         app.router.add_post("/api/send", self._send)
         app.router.add_get("/api/status", self._status)
+        app.router.add_post("/api/bot", self._bot_toggle)
         self.runner = web.AppRunner(app)
         await self.runner.setup()
         site = web.TCPSite(self.runner, "0.0.0.0", self.port)
@@ -1174,12 +1180,36 @@ class WebConsole:
         except Exception as exc:
             return web.json_response({"ok": False, "error": str(exc)}, status=500)
 
+    async def _bot_toggle(self, request):
+        """机器人启停：停止完全断开 WebSocket，控制台始终可用。"""
+        from aiohttp import web
+        body = await request.json()
+        action = str(body.get("action") or "")
+        try:
+            if action == "stop":
+                await self.bot.stop_bot()
+            elif action == "start":
+                await self.bot.start_bot()
+            else:
+                return web.json_response({"ok": False, "error": "未知操作"}, status=400)
+            return web.json_response({"ok": True, "running": getattr(self.bot, "bot_running", False)})
+        except Exception as exc:
+            logger.warning("机器人启停失败: %s", exc)
+            return web.json_response({"ok": False, "error": str(exc)}, status=500)
+
     async def _status(self, request):
         from aiohttp import web
         s = self.bot.stats
         uptime = int(time.time() - self.bot.start_time)
         h, m = uptime // 3600, uptime % 3600 // 60
+        ws_ok = False
+        try:
+            ws_ok = bool(getattr(self.bot.im._ws, "is_connected", False))    # property
+        except Exception:
+            pass
         return web.json_response({
+            "running": getattr(self.bot, "bot_running", False),
+            "ws_connected": ws_ok,
             "uptime": f"{h}小时{m}分",
             "checked": s.get("checked_messages", 0),
             "chats": getattr(self.bot.human_ai, "chat_count", 0) if getattr(self.bot, "human_ai", None) else 0,

@@ -650,12 +650,30 @@ class GroupModerationBot:
         self.im.on_message(self.handle_message)
 
         await self.im.start_listening()
+        self.bot_running = True    # 控制台启停开关状态
         self._cleanup_task = asyncio.create_task(self._cleanup_loop())
         asyncio.create_task(self._token_refresh_loop())
         asyncio.create_task(self._memory_loop())
 
         await self._shutdown.wait()
         await self.shutdown()
+
+    # ---------------- 控制台启停 ----------------
+    async def stop_bot(self):
+        """停止机器人：完全断开 WebSocket（不再收发消息），Web 控制台不受影响。"""
+        if not getattr(self, "bot_running", False):
+            return
+        await self.im.stop_listening()
+        self.bot_running = False
+        logger.info("机器人已停止（控制台操作），WebSocket 已断开")
+
+    async def start_bot(self):
+        """启动机器人：重新连接 WebSocket 并恢复消息处理。"""
+        if getattr(self, "bot_running", False):
+            return
+        await self.im.start_listening()
+        self.bot_running = True
+        logger.info("机器人已启动（控制台操作）")
 
     def _print_config(self):
         cfg = self.config
