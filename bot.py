@@ -651,6 +651,7 @@ class GroupModerationBot:
 
         self.unmute_tasks: Dict[Tuple[int, int], asyncio.Task] = {}
         self._admin_cache: Dict[int, Tuple[bool, float]] = {}   # group_id -> (is_admin, ts)
+        self._owner_cache: Dict[int, Tuple[Optional[int], float]] = {}   # group_id -> (owner_id, ts)
         self._runtime_punch_enabled = config.punch_enabled
         self._name_cache: Dict[str, Tuple[int, str]] = {}       # 名称解析缓存 u:/g: 前缀
         self._nick_cache: Dict[int, str] = {}                   # user_id -> 昵称
@@ -1166,6 +1167,24 @@ class GroupModerationBot:
             pass    # 正常去重
 
     # ---------------- 禁言 / 解禁 ----------------
+    async def get_group_owner_id(self, group_id: int) -> Optional[int]:
+        """取群主 ID（带缓存）。群主在成员列表里 isManager 可能为 false，但禁言接口会拒绝包含群主的批次。"""
+        cached = self._owner_cache.get(group_id)
+        if cached and time.time() - cached[1] < 600:
+            return cached[0]
+        owner = None
+        try:
+            groups = await self.im.aget_groups()
+            for g in groups or []:
+                d = g if isinstance(g, dict) else getattr(g, "__dict__", {})
+                if int(d.get("id") or 0) == group_id:
+                    owner = int(d.get("owner_id") or 0) or None
+                    break
+        except Exception as exc:
+            logger.warning("获取群主失败: %s", exc)
+        self._owner_cache[group_id] = (owner, time.time())
+        return owner
+
     async def is_bot_group_admin(self, group_id: int) -> bool:
         cached = self._admin_cache.get(group_id)
         if cached and time.time() - cached[1] < 300:
@@ -1555,6 +1574,10 @@ class GroupModerationBot:
         if err:
             await self.reply(msg, is_group, f"❌ {err}", group_id)
             return
+        owner_id = await self.get_group_owner_id(group_id)
+        if owner_id and target == owner_id:
+            await self.reply(msg, is_group, "❌ 群主不能被禁言", group_id)
+            return
         duration = -1     # 永久
         reason = ""
         if rest and rest[0].isdigit():
@@ -1581,13 +1604,14 @@ class GroupModerationBot:
             await self.reply(msg, is_group, f"❌ 获取群成员失败: {exc}", group_id)
             return
         targets = []
+        owner_id = await self.get_group_owner_id(group_id)
         for m in members or []:
             uid = int(m.get("userId") or 0)
-            if uid == self.bot_id or m.get("isManager"):
-                continue    # 跳过自己和群管理员
+            if uid == self.bot_id or uid == owner_id or m.get("isManager"):
+                continue    # 跳过自己、群主和群管理员
             targets.append(uid)
         if not targets:
-            await self.reply(msg, is_group, "没有可禁言的普通成员", group_id)
+            await self.reply(msg, is_group, "没有可禁言的普通成员（群主/管理员不可禁言）", group_id)
             return
         ok = True
         for i in range(0, len(targets), 50):
@@ -1646,8 +1670,10 @@ class GroupModerationBot:
         except Exception as exc:
             await self.reply(msg, is_group, f"❌ 获取群成员失败: {exc}", group_id)
             return
+        # 群主不能出现在批量禁言/解禁列表里（服务端会整批拒绝）
+        owner_id = await self.get_group_owner_id(target_group)
         ids = [int(m.get("userId") or 0) for m in members or []]
-        ids = [i for i in ids if i]
+        ids = [i for i in ids if i and i != owner_id]
         try:
             for i in range(0, len(ids), 50):
                 await self.im.aset_group_member_muted(target_group, ids[i:i + 50], False)
