@@ -495,7 +495,7 @@ class HumanAI:
             "model": self.config.ai_model_id,
             "messages": messages,
             "stream": False,
-            "max_tokens": 500,      # 防止截断只剩思考文本
+            "max_tokens": self.config.ai_max_tokens,   # 思考+回复共用额度，太小会被思考吃光导致截断
             "temperature": 0.95,
             "presence_penalty": 0.6,
         }
@@ -571,16 +571,25 @@ class HumanAI:
                 return None
 
         try:
-            text = str((((data.get("choices") or [{}])[0]).get("message") or {}).get("content") or "").strip()
+            text, finish = self._extract_reply(data)
         except Exception:
-            text = ""
+            text, finish = "", ""
+        # 被 max_tokens 截断且拿到的全是/为空思考时，重试一次
+        if finish == "length" and (not text or self._looks_like_meta(text)):
+            logger.warning("AI 回复被 token 截断（思考吃掉额度），重试一次")
+            try:
+                data = await self._chat_request(messages, use_tools)
+                text, finish = self._extract_reply(data)
+            except Exception as exc:
+                logger.warning("AI 重试失败: %s", exc)
+                return None
         if not text:
             return None
 
         # 兜底去 AI 味：剥掉 markdown 符号与开头自称
         text = re.sub(r"[*#`>|]", "", text)
         text = re.sub(r"^(?:作为(?:一个)?(?:AI|人工智能|模型|助手)[，,]?)", "", text)
-        text = text.strip().strip("“”\"'")[:200]
+        text = text.strip().strip("“”\"'")[:self.config.ai_max_reply_len]
 
         # 思考链拦截：模型把规划/自我分析当回复输出时直接丢弃
         if self._looks_like_meta(text):
@@ -591,6 +600,13 @@ class HumanAI:
         self.remember(group_id, asker, question)
         self.remember(group_id, "我", text, is_bot=True)
         return text
+
+    def _extract_reply(self, data: Dict[str, Any]) -> Tuple[str, str]:
+        """从响应中取正式回复和 finish_reason。推理模型的思考在 reasoning_content 里，不取。"""
+        choice = (data.get("choices") or [{}])[0]
+        message = choice.get("message") or {}
+        text = str(message.get("content") or "").strip()
+        return text, str(choice.get("finish_reason") or "")
 
     META_HINTS = (
         "作为活人", "作为群里的活人", "作为真人", "我作为群里", "我作为活人",
@@ -964,7 +980,7 @@ class HumanAI:
                 {"role": "user", "content": "\n".join(lines)},
             ],
             "stream": False,
-            "max_tokens": 400,
+            "max_tokens": 800,
             "temperature": 0.3,
         }
         headers = {"Authorization": f"Bearer {self.config.ai_api_key}", "Content-Type": "application/json"}

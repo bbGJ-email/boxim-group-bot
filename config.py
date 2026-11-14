@@ -56,6 +56,8 @@ class BotConfig:
     ai_timeout: float = 15.0
     ai_error_disable_seconds: float = 60.0   # 连续出错后临时禁用时长
     ai_max_consecutive_errors: int = 3
+    ai_max_tokens: int = int(os.environ.get("AI_MAX_TOKENS", "2048"))          # 单次生成额度（思考+回复共用）
+    ai_max_reply_len: int = int(os.environ.get("AI_MAX_REPLY_LEN", "400"))     # 最终回复保留的最大字数
 
     # ---- 自动解禁 / 自动举报 ----
     auto_unmute_enabled: bool = True
