@@ -42,11 +42,19 @@
 - 累计 5 条未整理消息自动交给 AI **归纳成条目**进入长期记忆池（JSON 持久化，每群上限 400 条）——记忆存的是归纳后的事实，不是消息原文
 - AI 回复时注入的是**当天已归纳的记忆条目**（不注入消息原文），需要更早的再调工具检索
 
-### Agent 工具（全部公开免费 API，无需 key）
+### Agent 工具（全部公开免费 API 或本地计算，无需 key）
 - `search_memory`：检索本群长期记忆（2-gram 关键词 + 时间衰减加权）
-- `get_weather`：open-meteo 实时天气 + 今明两天预报
+- `get_weather`：open-meteo 地理编码 + met.no 实时天气和预报
 - `web_search`：DuckDuckGo 即时答案，兜底维基百科中文
 - `get_exchange_rate`：open.er-api.com 实时汇率
+- `calculate`：本地精确数学计算（白名单符号 + 受限求值）
+- `read_url`：r.jina.ai 读取网页内容摘要
+- `get_hot_list`：60s API 微博/抖音热搜榜
+- `get_holiday`：chinesecalendar 本地库，工作日/节假日 + 下一个假期倒计时
+- `get_stock`：腾讯免费实时行情（A股/港股）
+- `translate`：MyMemory 免费翻译（5000 字/天/IP）
+- `get_quote`：一言 API 随机语录
+- `get_ip_location`：ip-api.com IP 归属地（HTTP）
 
 ### Web 控制台
 - 机器人进程内置 HTTP 服务（默认 `:8901`，`WEB_PORT` 可配）

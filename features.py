@@ -8,11 +8,13 @@
 import asyncio
 import json
 import logging
+import math
 import os
 import random
 import re
 import time
 import zoneinfo
+from datetime import date as _date, timedelta as _timedelta
 from collections import deque
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -25,6 +27,12 @@ try:
     from boxim.util.core.types import MessageType
 except ImportError:    # pragma: no cover
     MessageType = None
+
+# 中国节假日本地库（chinesecalendar），缺失时工具友好降级
+try:
+    import chinese_calendar as _cn_cal
+except ImportError:
+    _cn_cal = None
 
 # met.no 天气符号代码 → 中文（取 _ 前的主体部分匹配）
 SYMBOL_CN = {
@@ -286,6 +294,111 @@ class HumanAI:
                 },
             },
         },
+        {
+            "type": "function",
+            "function": {
+                "name": "calculate",
+                "description": "精确计算数学表达式。涉及加减乘除、幂、开方、对数等具体计算时调用，不要自己心算。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "expression": {"type": "string", "description": "数学表达式，如 (128+96)/4、2**10、sqrt(144)"},
+                    },
+                    "required": ["expression"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "read_url",
+                "description": "读取网页链接的文字内容摘要。有人发链接问里面讲了什么时调用。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "url": {"type": "string", "description": "网页链接，https:// 开头"},
+                    },
+                    "required": ["url"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_hot_list",
+                "description": "获取热搜榜单（支持微博、抖音）。有人问今天有什么热搜/瓜/热点时调用。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "platform": {"type": "string", "description": "平台：weibo（微博）或 douyin（抖音），默认 weibo"},
+                    },
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_holiday",
+                "description": "查询某天是不是工作日/节假日，以及下一个法定假期还有几天。有人问放假、调休、倒计时之类时调用。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "date": {"type": "string", "description": "日期，如 2026-11-14，不填默认今天"},
+                    },
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_stock",
+                "description": "查询股票实时行情（A股/港股）。有人问某只股票价格时调用。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "symbol": {"type": "string", "description": "股票代码，如 sh600519（沪）、sz000001（深）、hk00700（港）"},
+                    },
+                    "required": ["symbol"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "translate",
+                "description": "把一段文字翻译成指定语言。有人让你翻译时调用。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "text": {"type": "string", "description": "要翻译的内容"},
+                        "target_language": {"type": "string", "description": "目标语言，如 中文、英文、日文，默认中文"},
+                    },
+                    "required": ["text"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_quote",
+                "description": "随机来一句语录/句子。适合冷场时用，别频繁调用。",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_ip_location",
+                "description": "查询 IP 地址的归属地（国家/省市/运营商）。有人发 IP 问是哪的时调用。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "ip": {"type": "string", "description": "IPv4 地址，如 1.2.3.4"},
+                    },
+                    "required": ["ip"],
+                },
+            },
+        },
     ]
 
     def __init__(self, config, im, memory: GroupMemory):
@@ -328,7 +441,10 @@ class HumanAI:
             parts.append("【长期记忆里相关的回忆】\n" + "\n".join(hits))
         parts.append(
             "你可以调用工具：search_memory（查本群记忆）、get_weather（查天气）、"
-            "web_search（联网搜资料）、get_exchange_rate（查汇率）。"
+            "web_search（联网搜资料）、get_exchange_rate（查汇率）、calculate（数学计算）、"
+            "read_url（读网页链接）、get_hot_list（热搜榜，微博/抖音）、get_holiday（节假日/放假倒计时）、"
+            "get_stock（股票行情）、translate（翻译）、get_quote（随机语录）、get_ip_location（IP归属地）。"
+            "涉及具体数字计算必须用 calculate，别自己心算。"
             "需要外部信息时才用，别每次都用；查完用你自己的口吻说人话，禁止报一堆数据像客服。"
         )
         return "\n\n".join(parts)
@@ -453,6 +569,23 @@ class HumanAI:
             if name == "get_exchange_rate":
                 return await self._tool_rate(str(args.get("from_currency") or "CNY"),
                                              str(args.get("to_currency") or "USD"))
+            if name == "calculate":
+                return self._tool_calc(str(args.get("expression") or ""))
+            if name == "read_url":
+                return await self._tool_read_url(str(args.get("url") or ""))
+            if name == "get_hot_list":
+                return await self._tool_hot_list(str(args.get("platform") or "weibo"))
+            if name == "get_holiday":
+                return self._tool_holiday(str(args.get("date") or ""))
+            if name == "get_stock":
+                return await self._tool_stock(str(args.get("symbol") or ""))
+            if name == "translate":
+                return await self._tool_translate(str(args.get("text") or ""),
+                                                  str(args.get("target_language") or "中文"))
+            if name == "get_quote":
+                return await self._tool_quote()
+            if name == "get_ip_location":
+                return await self._tool_ip_location(str(args.get("ip") or ""))
             return f"未知工具: {name}"
         except Exception as exc:
             logger.warning("工具 %s 执行失败: %s", name, exc)
@@ -589,6 +722,182 @@ class HumanAI:
         if quote not in rates:
             return f"查不到 {base} → {quote}"
         return f"1 {base} ≈ {rates[quote]} {quote}（汇率仅供参考）"
+
+    # ---- 本地计算（白名单符号 + 受限 eval，不碰网络）----
+    CALC_FUNCS = {
+        "sqrt": math.sqrt, "abs": abs, "sin": math.sin, "cos": math.cos, "tan": math.tan,
+        "log": math.log, "log2": math.log2, "log10": math.log10, "exp": math.exp,
+        "round": round, "min": min, "max": max, "floor": math.floor, "ceil": math.ceil,
+        "pow": pow, "factorial": math.factorial,
+    }
+
+    def _tool_calc(self, expr: str) -> str:
+        expr = expr.strip()
+        if not expr:
+            return "缺表达式"
+        expr = expr.replace("×", "*").replace("÷", "/").replace("^", "**").replace("π", "pi")
+        if not re.fullmatch(r"[\d\.\+\-\*/%\(\),\sa-zA-Z]+", expr):
+            return "只支持纯数学表达式"
+        names = set(re.findall(r"[a-zA-Z_]+", expr))
+        bad = names - set(self.CALC_FUNCS) - {"pi", "e", "tau"}
+        if bad:
+            return f"不认识的符号: {', '.join(sorted(bad))}"
+        env = {n: getattr(math, n) for n in names if hasattr(math, n)}
+        try:
+            val = eval(expr, {"__builtins__": {}}, env)    # noqa: S307 已做白名单校验
+        except Exception as exc:
+            return f"算不出来: {exc}"
+        if isinstance(val, float) and val.is_integer() and abs(val) < 1e15:
+            val = int(val)
+        return f"= {val}"
+
+    async def _tool_read_url(self, url: str) -> str:
+        """r.jina.ai 免费网页转文本。"""
+        url = url.strip()
+        if not url:
+            return "缺链接"
+        if not url.startswith(("http://", "https://")):
+            url = "https://" + url
+        headers = {"User-Agent": "boxim-group-bot/1.0 (https://github.com/bbGJ-email/boxim-group-bot)"}
+        async with self._session.get("https://r.jina.ai/" + url, headers=headers) as resp:
+            if resp.status != 200:
+                return f"网页读取失败（{resp.status}）"
+            text = await resp.text()
+        text = re.sub(r"\n{2,}", "\n", text).strip()
+        if not text:
+            return "网页内容是空的"
+        return text[:600] + ("…" if len(text) > 600 else "")
+
+    HOT_PLATFORMS = {"weibo": "微博", "douyin": "抖音"}
+
+    async def _tool_hot_list(self, platform: str) -> str:
+        """60s 开源聚合 API 的热搜榜（免费无 key）。"""
+        platform = platform.strip().lower()
+        key = next((k for k, v in self.HOT_PLATFORMS.items()
+                    if k in platform or v in platform), "weibo")
+        headers = {"User-Agent": "boxim-group-bot/1.0 (https://github.com/bbGJ-email/boxim-group-bot)"}
+        async with self._session.get(f"https://60s.viki.moe/v2/{key}",
+                                     headers=headers) as resp:
+            d = await resp.json(content_type=None)
+        items = (d.get("data") or [])[:5]
+        if not items:
+            return "暂时拿不到热搜"
+        out = [f"【{self.HOT_PLATFORMS[key]}热榜】"]
+        for i, it in enumerate(items, 1):
+            title = str(it.get("title") or "").strip()
+            if not title:
+                continue
+            hot = it.get("hot_value")
+            out.append(f"{i}. {title}" + (f"（热度 {hot}）" if hot else ""))
+        return "\n".join(out)
+
+    def _tool_holiday(self, date_str: str) -> str:
+        """chinesecalendar 本地库：当天性质 + 下一个法定假期倒计时。"""
+        if _cn_cal is None:
+            return "节假日库未安装"
+        d = None
+        s = date_str.strip()
+        if s:
+            m = re.search(r"(\d{4})[-/年\.]?(\d{1,2})[-/月\.]?(\d{1,2})", s)
+            if m:
+                try:
+                    d = _date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+                except ValueError:
+                    return "日期不对"
+        if d is None:
+            d = _date.today()
+        try:
+            workday = _cn_cal.is_workday(d)
+            _, name = _cn_cal.get_holiday_detail(d)
+        except NotImplementedError:
+            return "节假日数据还没更新到这个年份"
+        day_desc = d.strftime("%Y-%m-%d")
+        today_part = f"{day_desc} 是" + (f"「{name}」假期" if name else ("工作日" if workday else "休息日（周末）"))
+        # 找下一个法定假期
+        nd = d
+        for _ in range(500):
+            nd += _timedelta(days=1)
+            try:
+                _, nm = _cn_cal.get_holiday_detail(nd)
+            except NotImplementedError:
+                return today_part + "；更远的假期数据还没更新"
+            if nm:
+                return f"{today_part}；下一个假期「{nm}」从 {nd.strftime('%m-%d')} 开始，还有 {(nd - d).days} 天"
+        return today_part + "；近期没有法定假期"
+
+    async def _tool_stock(self, symbol: str) -> str:
+        """腾讯免费实时行情（A股/港股）。"""
+        symbol = symbol.strip().lower()
+        if not re.fullmatch(r"(sh|sz|bj|hk)\d{4,6}", symbol):
+            return "代码格式不对，示例：sh600519（沪）、sz000001（深）、hk00700（港）"
+        headers = {"User-Agent": "boxim-group-bot/1.0 (https://github.com/bbGJ-email/boxim-group-bot)"}
+        async with self._session.get(f"https://qt.gtimg.cn/q={symbol}",
+                                     headers=headers) as resp:
+            raw = await resp.read()
+        text = raw.decode("gbk", errors="replace")
+        m = re.search(r'="([^"]*)"', text)
+        if not m or "~" not in m.group(1):
+            return "查不到这只股票"
+        f = m.group(1).split("~")
+        if len(f) < 35:
+            return "行情数据不完整"
+        return (f"{f[1]}（{symbol.upper()}）现价 {f[3]}，涨跌 {f[31]}（{f[32]}%），"
+                f"今开 {f[5]}，最高 {f[33]}，最低 {f[34]}，昨收 {f[4]}")
+
+    TRANSLATE_LANGS = {
+        "中文": "zh-CN", "汉语": "zh-CN", "英语": "en", "英文": "en",
+        "日文": "ja", "日语": "ja", "韩语": "ko", "韩文": "ko",
+        "法文": "fr", "法语": "fr", "德文": "de", "德语": "de",
+        "俄文": "ru", "俄语": "ru", "西班牙语": "es", "繁体": "zh-TW",
+    }
+
+    async def _tool_translate(self, text: str, target_language: str) -> str:
+        """MyMemory 免费翻译（无 key，每天 5000 字/IP），按有无中文猜源语言。"""
+        text = text.strip()
+        if not text:
+            return "缺要翻译的内容"
+        tl = target_language.strip()
+        tl = self.TRANSLATE_LANGS.get(tl, tl)
+        if not re.fullmatch(r"[a-zA-Z\-]{2,8}", tl):
+            tl = "zh-CN"
+        has_cjk = bool(re.search(r"[\u4e00-\u9fff]", text))
+        src = "zh-CN" if has_cjk else "en"
+        if (tl.startswith("zh") and has_cjk) or (tl == "en" and not has_cjk):
+            return "这本来就是目标语言，不用翻"
+        headers = {"User-Agent": "boxim-group-bot/1.0 (https://github.com/bbGJ-email/boxim-group-bot)"}
+        async with self._session.get("https://api.mymemory.translated.net/get",
+                                     params={"q": text[:500], "langpair": f"{src}|{tl}"},
+                                     headers=headers) as resp:
+            d = await resp.json(content_type=None)
+        out = str(((d.get("responseData") or {}).get("translatedText")) or "").strip()
+        if not out:
+            return "翻译失败"
+        return out[:500]
+
+    async def _tool_quote(self) -> str:
+        """一言 API（hitokoto.cn，免费无 key）。"""
+        headers = {"User-Agent": "boxim-group-bot/1.0 (https://github.com/bbGJ-email/boxim-group-bot)"}
+        async with self._session.get("https://v1.hitokoto.cn/", headers=headers) as resp:
+            d = await resp.json(content_type=None)
+        q = str(d.get("hitokoto") or "").strip()
+        if not q:
+            return "今天没拿到句子"
+        frm = str(d.get("from") or "").strip()
+        return f"“{q}”" + (f" —— {frm}" if frm else "")
+
+    async def _tool_ip_location(self, ip: str) -> str:
+        """ip-api.com 免费归属地查询（HTTP）。"""
+        ip = ip.strip()
+        if not re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", ip):
+            return "IP 格式不对，要 IPv4，如 1.2.3.4"
+        headers = {"User-Agent": "boxim-group-bot/1.0 (https://github.com/bbGJ-email/boxim-group-bot)"}
+        async with self._session.get(f"http://ip-api.com/json/{ip}",
+                                     params={"lang": "zh-CN"}, headers=headers) as resp:
+            d = await resp.json(content_type=None)
+        if d.get("status") != "success":
+            return "查不到这个 IP"
+        return (f"{ip}：{d.get('country') or ''}{d.get('regionName') or ''}{d.get('city') or ''}"
+                + (f"（{d.get('isp')}）" if d.get("isp") else ""))
 
     async def summarize_pending(self, group_id: int) -> int:
         """把待整理消息交给 AI 汇总进记忆池，返回新增条数。"""
