@@ -17,6 +17,7 @@ import random
 import re
 import signal
 import sys
+import tempfile
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
@@ -883,44 +884,62 @@ class GroupModerationBot:
         return find(d)
 
     async def _fetch_image_data_url(self, url: str) -> Optional[str]:
-        """下载图片转 base64 data URL（供视觉模型），失败返回 None。"""
+        """下载图片转 base64 data URL（供视觉模型），失败返回 None。
+
+        注意：BoxIM 文件服务器会按 TLS 指纹拦截 Python HTTP 客户端（HTTP 567），
+        所以用 curl 子进程下载，再按文件魔数嗅探真实类型（非图片内容直接判失败）。
+        """
         if not url:
             return None
         if url.startswith("data:"):
             return url
         if url.startswith("/"):
             url = self.config.base_url.rstrip("/") + url
-        await self.human_ai._ensure_session()
-        headers = {}
+        fd, tmp_path = tempfile.mkstemp(suffix=".img")
+        os.close(fd)
         try:
-            token = self.im._http._resolve_access_token()
-            if token:
-                headers["Authorization"] = f"Bearer {token}"
-        except Exception:
-            pass
-        try:
-            async with self.human_ai._session.get(
-                    url, headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                if resp.status != 200:
-                    # 不带 token 再试一次
-                    async with self.human_ai._session.get(
-                            url, timeout=aiohttp.ClientTimeout(total=15)) as resp2:
-                        if resp2.status != 200:
-                            logger.warning("图片下载失败 %s: HTTP %s", url[:80], resp2.status)
-                            return None
-                        body, ctype = await resp2.read(), resp2.headers.get("Content-Type", "")
-                else:
-                    body, ctype = await resp.read(), resp.headers.get("Content-Type", "")
+            proc = await asyncio.create_subprocess_exec(
+                "curl", "-s", "-m", "20", "-o", tmp_path, url,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=25)
+            except asyncio.TimeoutError:
+                proc.kill()
+                logger.warning("图片下载超时: %s", url[:80])
+                return None
+            try:
+                size = os.path.getsize(tmp_path)
+            except OSError:
+                return None
+            if size == 0:
+                logger.warning("图片下载为空: %s", url[:80])
+                return None
+            if size > 6 * 1024 * 1024:
+                logger.warning("图片过大，跳过识别: %s", url[:80])
+                return None
+            with open(tmp_path, "rb") as f:
+                body = f.read()
+            # 魔数嗅探：既能定 MIME，也能挡掉 567 拦截页返回的 HTML
+            if body[:8] == b"\x89PNG\r\n\x1a\n":
+                ctype = "image/png"
+            elif body[:3] == b"\xff\xd8\xff":
+                ctype = "image/jpeg"
+            elif body[:6] in (b"GIF87a", b"GIF89a"):
+                ctype = "image/gif"
+            elif body[:4] == b"RIFF" and body[8:12] == b"WEBP":
+                ctype = "image/webp"
+            else:
+                logger.warning("图片下载内容非图片（疑似被拦截）: %s", url[:80])
+                return None
+            return f"data:{ctype};base64,{base64.b64encode(body).decode()}"
         except Exception as exc:
             logger.warning("图片下载异常 %s: %s", url[:80], exc)
             return None
-        if len(body) > 6 * 1024 * 1024:
-            logger.warning("图片过大，跳过识别: %s", url[:80])
-            return None
-        if not ctype.startswith("image/"):
-            ctype = "image/png" if url.lower().endswith(".png") else "image/jpeg"
-        return f"data:{ctype};base64,{base64.b64encode(body).decode()}"
+        finally:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
 
     async def _handle_image_message(self, msg: dict, sender_id: int, group_id: int, content: str):
         """图片消息：进记忆池、AI 看图对话、AI 看图审核。"""
