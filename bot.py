@@ -810,6 +810,12 @@ class GroupModerationBot:
         try:
             question = re.sub(r"^@\S+\s*", "", content, count=1).strip() or content
 
+            # AI 触发刷屏检测：疯狂 @机器人 / 反复回复机器人同样算刷屏
+            if self.config.flood_enabled and not self._should_skip(sender_id, group_id):
+                if await self._check_flood(msg, sender_id, group_id, content):
+                    logger.info("AI 对话触发刷屏处置，不回复: 群=%s 用户=%s", group_id, sender_id)
+                    return
+
             # 发给 AI 的内容也要审核（管理员/白名单豁免）：命中按违规处理，不再进行 AI 对话
             if not self._should_skip(sender_id, group_id):
                 detection = await self.detector.check(question)
@@ -916,6 +922,11 @@ class GroupModerationBot:
             nick = str(msg.get("sendNickName") or sender_id)
             img_url = self._extract_image_url(content)
             data_url = await self._fetch_image_data_url(img_url) if img_url else None
+
+            # AI 触发刷屏检测（连续发图 @机器人同样算刷屏）
+            if self.config.flood_enabled and not self._should_skip(sender_id, group_id):
+                if await self._check_flood(msg, sender_id, group_id, "[图片]"):
+                    return
 
             # 记忆池 / 短期上下文：图片以占位符记录（文本归纳时 AI 能感知有人发过图）
             self.memory.add_message(group_id, nick, "[图片]")
@@ -1461,8 +1472,14 @@ class GroupModerationBot:
 
         await self.send_group(
             group_id,
-            f"📨 已{'自动' if auto else ''}举报用户 @{user_name}（违规 {violation_count} 次）\n"
-            f"类型: {self.config.complaint_reason}",
+            "🚨【正式举报通知】🚨\n"
+            f"用户 @{user_name}（ID: {user_id}）因累计违规 {violation_count} 次，"
+            "已由本群管理机器人通过盒子IM官方举报渠道正式提交违规举报，本次举报即时生效且无法撤回。\n"
+            f"举报类型: {self.config.complaint_reason}\n"
+            "该举报已直接进入盒子官方审核流程，官方将依据平台规则对被举报账号进行审查与处置，"
+            "情节严重者可能面临禁言、封号等处罚。\n"
+            "郑重警告：若继续发送违规内容、恶意刷屏或骚扰他人，将被再次举报并叠加处置，"
+            "由此导致账号被封等一切后果由本人自行承担。请立即停止违规行为，自觉遵守社区规范。",
             at_users=[user_id],
         )
         return True
