@@ -439,14 +439,17 @@ class HumanAI:
         hits = self.memory.search(group_id, question)
         if hits:
             parts.append("【长期记忆里相关的回忆】\n" + "\n".join(hits))
-        parts.append(
-            "你可以调用工具：search_memory（查本群记忆）、get_weather（查天气）、"
-            "web_search（联网搜资料）、get_exchange_rate（查汇率）、calculate（数学计算）、"
-            "read_url（读网页链接）、get_hot_list（热搜榜，微博/抖音）、get_holiday（节假日/放假倒计时）、"
-            "get_stock（股票行情）、translate（翻译）、get_quote（随机语录）、get_ip_location（IP归属地）。"
-            "涉及具体数字计算必须用 calculate，别自己心算。"
-            "需要外部信息时才用，别每次都用；查完用你自己的口吻说人话，禁止报一堆数据像客服。"
-        )
+        if self._tools_ok is not False:
+            parts.append(
+                "你可以调用工具：search_memory（查本群记忆）、get_weather（查天气）、"
+                "web_search（联网搜资料）、get_exchange_rate（查汇率）、calculate（数学计算）、"
+                "read_url（读网页链接）、get_hot_list（热搜榜，微博/抖音）、get_holiday（节假日/放假倒计时）、"
+                "get_stock（股票行情）、translate（翻译）、get_quote（随机语录）、get_ip_location（IP归属地）。"
+                "涉及具体数字计算必须用 calculate，别自己心算。"
+                "需要外部信息时才用，别每次都用；查完用你自己的口吻说人话，禁止报一堆数据像客服。"
+            )
+        else:
+            parts.append("（当前没有任何可用工具，答不上来的就直接说不知道，禁止描述或假装调用任何工具。）")
         return "\n\n".join(parts)
 
     def _build_messages(self, group_id: int, asker: str, question: str,
@@ -467,7 +470,7 @@ class HumanAI:
             "model": self.config.ai_model_id,
             "messages": messages,
             "stream": False,
-            "max_tokens": 200,
+            "max_tokens": 500,      # 防止截断只剩思考文本
             "temperature": 0.95,
             "presence_penalty": 0.6,
         }
@@ -550,10 +553,27 @@ class HumanAI:
         text = re.sub(r"[*#`>|]", "", text)
         text = re.sub(r"^(?:作为(?:一个)?(?:AI|人工智能|模型|助手)[，,]?)", "", text)
         text = text.strip().strip("“”\"'")[:200]
+
+        # 思考链拦截：模型把规划/自我分析当回复输出时直接丢弃
+        if self._looks_like_meta(text):
+            logger.warning("AI 输出疑似思考内容，已丢弃: %r", text[:80])
+            return None
+
         self.chat_count += 1
         self.remember(group_id, asker, question)
         self.remember(group_id, "我", text, is_bot=True)
         return text
+
+    META_HINTS = (
+        "作为活人", "作为群里的活人", "作为真人", "我作为群里", "我作为活人",
+        "现在调用", "调用工具", "调用天气工具", "调用搜索工具", "调用记忆工具",
+        "要回复得", "回复要短", "回复要口语", "字数限制", "不能说自己是",
+        "看规则", "按规则", "反AI味", "去AI味", "符合字数",
+    )
+
+    def _looks_like_meta(self, text: str) -> bool:
+        hits = sum(1 for p in self.META_HINTS if p in text)
+        return hits >= 2 or (hits >= 1 and len(text) > 50)
 
     # ---------------- Agent 工具 ----------------
     async def _execute_tool(self, name: str, args: dict, group_id: int) -> str:
