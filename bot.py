@@ -10,6 +10,7 @@
 """
 import asyncio
 import base64
+import difflib
 import json
 import logging
 import os
@@ -660,6 +661,7 @@ class GroupModerationBot:
         self._flood_warn_ts: Dict[Tuple[int, int], float] = {}  # 上次刷屏警告时间
         self._last_group_seq: Dict[int, int] = {}               # 各群最新 seqNo（控制台翻页用）
         self._last_private_seq: Dict[int, int] = {}             # 各私聊最新 seqNo
+        self._pending_cmds: Dict[Tuple[int, int], dict] = {}    # (group, user) -> 模糊命令待确认项
 
         # 运行统计
         self.stats = {
@@ -785,6 +787,11 @@ class GroupModerationBot:
                 await self._handle_image_message(msg, sender_id, group_id, content)
                 return
 
+            # 模糊命令确认：回复机器人询问消息的「是的/编号」优先消费
+            if msg_type == 0 and content.strip() and sender_id != self.bot_id:
+                if await self._check_pending_confirm(msg, sender_id, group_id, content):
+                    return
+
             # AI 拟人对话：@机器人 或 回复机器人（群内）
             if msg_type == 0 and content.strip() and sender_id != self.bot_id \
                     and self.config.ai_chat_enabled and group_id not in self.config.whitelist_groups \
@@ -803,7 +810,13 @@ class GroupModerationBot:
                 if self._match_command(content):
                     await self.handle_command(msg, is_group)
                     return
-                # 「/」开头但不是合法命令 → 当普通文本处理（防止加 / 绕过审核）
+                # 「/」开头但不是合法命令 → 先试模糊匹配，问用户是不是想输别的命令
+                parts = content[len(self.config.trigger_char):].split()
+                suggestions = self._fuzzy_match_command(content, sender_id) if parts else []
+                if suggestions:
+                    await self._ask_command_suggestion(msg, sender_id, group_id, parts, suggestions)
+                    return
+                # 没有相似命令 → 当普通文本处理（防止加 / 绕过审核）
                 nick = str(msg.get("sendNickName") or sender_id)
                 self.memory.add_message(group_id, nick, content)
                 self.human_ai.remember(group_id, nick, content)
@@ -1559,23 +1572,23 @@ class GroupModerationBot:
 
     # ---------------- 命令分发 ----------------
     COMMANDS: Dict[str, List[str]] = {
-        "mute": ["禁言", "mute"],
-        "mute_all": ["禁言所有人", "muteall", "全员禁言"],
-        "unmute": ["解禁", "unmute"],
-        "unmute_all": ["解禁群所有人", "unmuteall"],
-        "violations": ["违规记录", "violations"],
+        "mute": ["禁言", "mute", "jinyan"],
+        "mute_all": ["禁言所有人", "muteall", "全员禁言", "jinyanquanbu"],
+        "unmute": ["解禁", "unmute", "jiejin", "jiej"],
+        "unmute_all": ["解禁群所有人", "unmuteall", "jiejinquanbu"],
+        "violations": ["违规记录", "violations", "weigui"],
         "cleanup": ["清理记录", "clean"],
-        "whitelist": ["白名单", "whitelist"],
-        "report": ["举报用户", "report"],
+        "whitelist": ["白名单", "whitelist", "baimingdan"],
+        "report": ["举报用户", "report", "jubaoyonghu"],
         "reports": ["举报记录", "reports"],
         "report_stats": ["举报统计", "reportstats"],
         "test_detect": ["检测测试", "testdetect"],
         "ai_check": ["ai检查", "aitest", "AI检查"],
         "ai_stats": ["ai统计", "aistats"],
-        "status": ["状态", "status"],
-        "help": ["管理帮助", "help", "菜单"],
-        "punch": ["punch", "签到"],
-        "punch_rank": ["签到排行", "punchrank"],
+        "status": ["状态", "status", "zhuangtai"],
+        "help": ["管理帮助", "help", "菜单", "bangzhu"],
+        "punch": ["punch", "签到", "qiandao"],
+        "punch_rank": ["签到排行", "punchrank", "paixing"],
         "punch_toggle": ["签到开关", "punchtoggle"],
     }
 
@@ -1590,6 +1603,100 @@ class GroupModerationBot:
             if cmd in [a.lower() for a in aliases]:
                 return name, parts[1:]
         return None
+
+    # ---------------- 模糊命令匹配 ----------------
+    CMD_SUGGEST_EXPIRE = 120    # 待确认有效期（秒）
+
+    def _allowed_commands(self, sender_id: int) -> Dict[str, List[str]]:
+        """该用户可用的命令表（模糊建议只提示可用的，避免扰民）。"""
+        if sender_id in self.config.admin_ids:
+            return self.COMMANDS
+        return {n: a for n, a in self.COMMANDS.items() if n in ("punch", "punch_rank")}
+
+    def _fuzzy_match_command(self, text: str, sender_id: int) -> List[str]:
+        """返回与输入相似的后台命令名列表（按相似度降序，最多 4 个）。"""
+        parts = text[len(self.config.trigger_char):].split()
+        if not parts:
+            return []
+        cmd = parts[0].strip().lower()
+        if len(cmd) < 2:
+            return []
+        allowed = self._allowed_commands(sender_id)
+        scored = []
+        for name, aliases in allowed.items():
+            best = 0.0
+            for a in aliases:
+                al = a.lower()
+                r = difflib.SequenceMatcher(None, cmd, al).ratio()
+                if len(cmd) >= 2 and (al.startswith(cmd) or cmd.startswith(al)):
+                    r = max(r, 0.85)    # 前缀命中直接算高相似
+                best = max(best, r)
+            if best >= 0.6:
+                scored.append((best, name))
+        scored.sort(reverse=True)
+        return [n for _, n in scored[:4]]
+
+    async def _ask_command_suggestion(self, msg: dict, sender_id: int, group_id: int,
+                                      parts: List[str], suggestions: List[str]):
+        """发送模糊命令询问并挂起待确认。"""
+        key = (group_id, sender_id)
+        pend = {"args": parts[1:], "options": suggestions,
+                "expire": time.time() + self.CMD_SUGGEST_EXPIRE}
+        self._pending_cmds[key] = pend
+        if len(suggestions) == 1:
+            alias = self.COMMANDS[suggestions[0]][0]
+            text = (f"🤔 你是想输入「/{alias}」吗？\n"
+                    f"引用本条消息回复「是的」我就帮你执行，回复「不是」取消"
+                    f"（{self.CMD_SUGGEST_EXPIRE // 60} 分钟内有效）")
+        else:
+            lines = ["🤔 你想输入的可能是："]
+            for i, name in enumerate(suggestions, 1):
+                lines.append(f"{i}️⃣ /{self.COMMANDS[name][0]}")
+            lines.append(f"回复本条消息告诉我编号（如「1」）我就执行，回复「取消」放弃"
+                         f"（{self.CMD_SUGGEST_EXPIRE // 60} 分钟内有效）")
+            text = "\n".join(lines)
+        await self.send_group(group_id, text, at_users=[sender_id], signature=False)
+
+    async def _check_pending_confirm(self, msg: dict, sender_id: int, group_id: int, content: str) -> bool:
+        """处理对模糊命令询问的回复确认。返回 True 表示该消息已消费。"""
+        key = (group_id, sender_id)
+        pend = self._pending_cmds.get(key)
+        if not pend:
+            return False
+        quote = msg.get("quoteMessage") or {}
+        if not (isinstance(quote, dict) and quote.get("sendId") == self.bot_id):
+            return False    # 没引用机器人的消息，不算确认
+        if time.time() > pend["expire"]:
+            del self._pending_cmds[key]
+            return False
+        text = content.strip().lower()
+        options = pend["options"]
+        chosen = None
+        cancelled = re.search(r"^(不是|不|取消|算了|否)", text)
+        if len(options) == 1:
+            if re.search(r"^(是的?|对|确认|好|没错|嗯+)", text):
+                chosen = options[0]
+            elif cancelled:
+                del self._pending_cmds[key]
+                await self.send_group(group_id, "好的，已取消", group_id, signature=False)
+                return True
+        else:
+            m = re.match(r"^\s*([1-9])\D?", text)
+            if m and int(m.group(1)) <= len(options):
+                chosen = options[int(m.group(1)) - 1]
+            elif cancelled:
+                del self._pending_cmds[key]
+                await self.send_group(group_id, "好的，已取消", group_id, signature=False)
+                return True
+        if chosen is None:
+            return False    # 既不是确认也不是取消，继续走正常流程
+        del self._pending_cmds[key]
+        alias = self.COMMANDS[chosen][0]
+        fake = dict(msg)
+        fake["content"] = self.config.trigger_char + alias \
+            + ((" " + " ".join(pend["args"])) if pend["args"] else "")
+        await self.handle_command(fake, True)
+        return True
 
     async def handle_command(self, msg: dict, is_group: bool):
         content = msg.get("content", "") or ""
