@@ -854,7 +854,8 @@ class GroupModerationBot:
                     return
 
             # 发给 AI 的内容也要审核（管理员/白名单豁免）：命中按违规处理，不再进行 AI 对话
-            if not self._should_skip(sender_id, group_id):
+            # （词库 API 关闭时此处跳过，AI 对话输入不再过词库）
+            if self.config.sensitive_api_enabled and not self._should_skip(sender_id, group_id):
                 detection = await self.detector.check(question)
                 if not detection.get("error") and detection.get("is_sensitive"):
                     self.stats["sensitive_detected"] += 1
@@ -1156,11 +1157,17 @@ class GroupModerationBot:
         elif self.config.ai_recheck_enabled:
             ai_result = {"success": False, "is_sensitive": None, "reason": "AI 禁用中", "confidence": 0, "raw_response": ""}
 
-        detection = await self.detector.check(content)
-        if detection["error"]:
-            logger.warning("敏感词检测失败: %s", detection["error"])
-            return
-        word_hit = bool(detection.get("is_sensitive"))
+        # 敏感词词库 API 开关：关闭时跳过词库匹配，只靠 AI 复检 / 服务端打码
+        if self.config.sensitive_api_enabled:
+            detection = await self.detector.check(content)
+            if detection["error"]:
+                logger.warning("敏感词检测失败: %s", detection["error"])
+                return
+            word_hit = bool(detection.get("is_sensitive"))
+        else:
+            detection = {"is_sensitive": False, "sensitive_words": [], "positions": [],
+                         "masked_text": content, "hit_types": [], "error": None}
+            word_hit = False
         ai_hit = bool(ai_result and ai_result.get("success") and ai_result.get("is_sensitive"))
         if not (word_hit or ai_hit):
             return
@@ -2091,6 +2098,7 @@ class GroupModerationBot:
             "📊 机器人状态:",
             f"  已检查消息: {s['checked_messages']} | 群消息: {s['group_messages']}",
             f"  敏感检测: {s['sensitive_detected']} | 撤回: {s['recalled']} | 刷屏处置: {s['flood_triggered']}",
+            f"  词库API: {'✅ 开启' if self.config.sensitive_api_enabled else '⛔ 关闭（仅 AI 复检）'}",
             f"  AI: 检查 {self.ai.check_count} 次，确认 {self.ai.confirmed_count}，推翻 {self.ai.overturned_count}",
             f"  禁言: {s['muted_users']} 人 | 解禁: {s['unmuted_users']} 人",
             f"  命令: 禁言 {s['mute_commands']} 次 / 解禁 {s['unmute_commands']} 次",
