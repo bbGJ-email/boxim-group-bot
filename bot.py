@@ -19,6 +19,7 @@ import re
 import signal
 import sys
 import tempfile
+import threading
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
@@ -712,6 +713,15 @@ class GroupModerationBot:
         self.im.on_message(stats_middleware)
         self.im.on_message(self.handle_message)
 
+        # 强制下线自愈：账号被顶号/服务端踢下线时 SDK 可能死锁，直接重启进程重新登录
+        @self.im.on_event("force_offline")
+        def _on_force_offline(msg_data=None):
+            logger.warning("收到强制下线消息（账号可能在别处登录），10 秒后重启进程自愈")
+            threading.Thread(target=self._delayed_exit, args=(10,), daemon=True).start()
+
+        # watchdog：独立线程探测事件循环，卡死（控制台假死）时强制重启
+        self._start_watchdog(asyncio.get_running_loop())
+
         await self.im.start_listening()
         self.bot_running = True    # 控制台启停开关状态
         self._cleanup_task = asyncio.create_task(self._cleanup_loop())
@@ -722,6 +732,24 @@ class GroupModerationBot:
         await self.shutdown()
 
     # ---------------- 控制台启停 ----------------
+    def _delayed_exit(self, seconds: float):
+        time.sleep(seconds)
+        logger.warning("进程自愈退出，由 systemd 重新拉起")
+        os._exit(1)
+
+    def _start_watchdog(self, loop: asyncio.AbstractEventLoop):
+        """每 60 秒探测主事件循环，超过 15 秒无响应判定卡死，强制重启进程。"""
+        def probe():
+            while True:
+                time.sleep(60)
+                try:
+                    fut = asyncio.run_coroutine_threadsafe(asyncio.sleep(0.1), loop)
+                    fut.result(timeout=15)
+                except Exception:
+                    logger.error("事件循环无响应（疑似卡死），强制重启进程自愈")
+                    os._exit(1)
+        threading.Thread(target=probe, daemon=True, name="watchdog").start()
+
     async def stop_bot(self):
         """停止机器人：完全断开 WebSocket（不再收发消息），Web 控制台不受影响。"""
         if not getattr(self, "bot_running", False):
